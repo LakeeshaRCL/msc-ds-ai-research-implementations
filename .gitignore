@@ -314,3 +314,6 @@ _site/
 # experiment_*.ipynb
 # scratch/
 # sandbox/
+
+
+fitted_modules/
