@@ -47,3 +47,21 @@ def show_boxplot(data, column, title="", figure_size=(8, 5), color="skyblue", ho
     plt.show()
 
 
+def plot_categorical_distribution(df, column):
+
+    value_counts = df[column].value_counts()
+
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x=value_counts.index, y=value_counts.values, palette='Set2', hue=value_counts.index)
+    plt.xlabel(column)
+    plt.ylabel('Count')
+    plt.title(f'Distribution of {column}')
+    plt.xticks(rotation=45)
+
+    # Add count labels
+    for i, v in enumerate(value_counts.values):
+        plt.text(i, v, str(v), ha='center', va='bottom')
+
+    plt.tight_layout()
+    plt.show()
+
