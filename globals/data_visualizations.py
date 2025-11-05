@@ -65,3 +65,21 @@ def plot_categorical_distribution(df, column):
     plt.tight_layout()
     plt.show()
 
+
+def plot_pca(explained_variance, cumulative_variance):
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.bar(range(1, len(explained_variance) + 1), explained_variance)
+    plt.xlabel('Principal Component')
+    plt.ylabel('Variance Explained')
+    plt.title('Variance by Component')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(range(1, len(cumulative_variance) + 1), cumulative_variance, marker='o')
+    plt.axhline(y=0.95, color='r', linestyle='--', label='95% variance')
+    plt.xlabel('Number of Components')
+    plt.ylabel('Cumulative Variance Explained')
+    plt.title('Cumulative Variance')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
