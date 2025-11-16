@@ -13,7 +13,9 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     roc_auc_score,
-    roc_curve
+    roc_curve,
+    precision_recall_fscore_support,
+average_precision_score
 )
 import matplotlib.pyplot as plt
 
@@ -393,88 +395,14 @@ def comprehensive_evaluation(model, X_train, y_train, X_test, y_test,
     return results
 
 
-# Example usage
-if __name__ == "__main__":
-    print("Example 1: SVM Evaluation")
-    print("=" * 80)
-    from sklearn import datasets
-    from sklearn.model_selection import train_test_split
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.svm import SVC
-
-    # Load dataset
-    iris = datasets.load_iris()
-    X, y = iris.data, iris.target
-
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42
-    )
-
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    # Train SVM model
-    svm_model = SVC(kernel='rbf', probability=True, random_state=42)
-    svm_model.fit(X_train_scaled, y_train)
-
-    # Comprehensive evaluation
-    svm_results = comprehensive_evaluation(
-        svm_model, X_train_scaled, y_train, X_test_scaled, y_test,
-        model_type='sklearn', average='weighted', plot_roc=False
-    )
-
-    print("\n\n" + "=" * 80)
-    print("Example 2: XGBoost Evaluation")
-    print("=" * 80)
-    try:
-        import xgboost as xgb
-
-        # Train XGBoost model
-        xgb_model = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='mlogloss')
-        xgb_model.fit(X_train_scaled, y_train)
-
-        # Comprehensive evaluation
-        xgb_results = comprehensive_evaluation(
-            xgb_model, X_train_scaled, y_train, X_test_scaled, y_test,
-            model_type='xgboost', average='weighted', plot_roc=False
-        )
-    except ImportError:
-        print("XGBoost not installed. Skipping XGBoost example.")
-
-    print("\n\n" + "=" * 80)
-    print("Example 3: LSTM Evaluation (Keras/TensorFlow)")
-    print("=" * 80)
-    try:
-        from tensorflow import keras
-        from tensorflow.keras.utils import to_categorical
-
-        # Prepare data for LSTM (one-hot encode labels)
-        y_train_cat = to_categorical(y_train, num_classes=3)
-        y_test_cat = to_categorical(y_test, num_classes=3)
-
-        # Reshape for LSTM (samples, timesteps, features)
-        X_train_lstm = X_train_scaled.reshape((X_train_scaled.shape[0], 1, X_train_scaled.shape[1]))
-        X_test_lstm = X_test_scaled.reshape((X_test_scaled.shape[0], 1, X_test_scaled.shape[1]))
-
-        # Build LSTM model
-        lstm_model = keras.Sequential([
-            keras.layers.LSTM(32, input_shape=(1, 4)),
-            keras.layers.Dense(16, activation='relu'),
-            keras.layers.Dense(3, activation='softmax')
-        ])
-
-        lstm_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-        lstm_model.fit(X_train_lstm, y_train_cat, epochs=50, batch_size=16, verbose=0)
-
-        # Comprehensive evaluation
-        lstm_results = comprehensive_evaluation(
-            lstm_model, X_train_lstm, y_train_cat, X_test_lstm, y_test_cat,
-            model_type='keras', average='weighted', plot_roc=False
-        )
-    except ImportError:
-        print("TensorFlow/Keras not installed. Skipping LSTM example.")
-
-    print("\n\nAll evaluations completed successfully!")
+def classification_metrics(y_true, y_prob, threshold=0.5):
+    """Compute standard metrics for binary classification."""
+    y_pred = (y_prob >= threshold).astype(int)
+    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
+    return {
+        "precision": float(p),
+        "recall": float(r),
+        "f1": float(f1),
+        "roc_auc": float(roc_auc_score(y_true, y_prob)),
+        "auprc": float(average_precision_score(y_true, y_prob)),
+    }
