@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 from sklearn.model_selection import StratifiedKFold
 
-activation_functions = ["relu", "selu", "elu"]
+activation_functions = ["relu", "leaky_relu"]
 batch_sizes =[256, 512, 1024, 2048]
 hidden_layer_unit_choices = list(range(16, 257, 8))
 
@@ -75,8 +75,6 @@ def get_activation_layer(name: str):
     """Return a small set of easy-to-understand activation layers."""
     if name == "relu":
         return tf.keras.layers.Activation("relu")
-    if name == "elu":
-        return tf.keras.layers.ELU(alpha=1.0)
-    if name == "selu":
-        return tf.keras.layers.Activation("selu")
+    if name == "leaky_relu":
+        return tf.keras.layers.LeakyReLU(alpha=0.01)
     raise ValueError(f"Unknown activation {name}")

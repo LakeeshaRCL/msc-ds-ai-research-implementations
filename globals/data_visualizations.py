@@ -83,3 +83,99 @@ def plot_pca(explained_variance, cumulative_variance):
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+
+def show_class_count_plot(data, column, title=None, figure_size=(10, 6), color_palette="Set2", show_percentages=True):
+    """
+    Display a count plot for class distribution in classification datasets.
+    
+    Parameters:
+    -----------
+    data : pd.DataFrame or pd.Series or array-like
+        The data containing class labels. Can be a DataFrame, Series, or numpy array.
+    column : str or None
+        Column name if data is a DataFrame. Use None if data is a Series or array.
+    title : str, optional
+        Plot title. If None, auto-generates title based on column name.
+    figure_size : tuple, default=(10, 6)
+        Figure size (width, height) in inches.
+    color_palette : str, default="Set2"
+        Seaborn color palette name.
+    show_percentages : bool, default=True
+        Whether to show percentages alongside counts.
+    
+    Returns:
+    --------
+    None (displays plot)
+    
+    Examples:
+    ---------
+    # With DataFrame
+    show_class_count_plot(y_train_df, 'isFraud')
+    
+    # With Series or array
+    show_class_count_plot(y_train.to_numpy().ravel(), None, title='Class Distribution')
+    """
+    import numpy as np
+    
+    # Handle different input types
+    if isinstance(data, pd.DataFrame):
+        if column is None:
+            raise ValueError("column parameter is required when data is a DataFrame")
+        values = data[column]
+        col_name = column
+    elif isinstance(data, pd.Series):
+        values = data
+        col_name = data.name if data.name else "Class"
+    else:
+        # Assume numpy array or list
+        values = pd.Series(data)
+        col_name = column if column else "Class"
+    
+    # Get value counts
+    value_counts = values.value_counts().sort_index()
+    total = len(values)
+    
+    # Create figure
+    plt.figure(figsize=figure_size)
+    
+    # Create count plot
+    ax = sns.countplot(x=values, palette=color_palette, order=value_counts.index)
+    
+    # Set title
+    if title is None:
+        title = f'Class Distribution: {col_name}'
+    plt.title(title, fontsize=14, fontweight='bold')
+    
+    # Set labels
+    plt.xlabel(col_name, fontsize=12)
+    plt.ylabel('Count', fontsize=12)
+    
+    # Add count and percentage labels on bars
+    for i, (idx, count) in enumerate(value_counts.items()):
+        percentage = (count / total) * 100
+        
+        if show_percentages:
+            label = f'{count:,}\n({percentage:.2f}%)'
+        else:
+            label = f'{count:,}'
+        
+        ax.text(i, count, label, ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    # Add summary statistics in text box
+    stats_text = f'Total: {total:,}\n'
+    stats_text += f'Classes: {len(value_counts)}\n'
+    if len(value_counts) == 2:
+        # Binary classification - show imbalance ratio
+        class_0, class_1 = value_counts.iloc[0], value_counts.iloc[1]
+        ratio = max(class_0, class_1) / min(class_0, class_1)
+        stats_text += f'Imbalance Ratio: {ratio:.2f}:1'
+    
+    # Add text box with statistics
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=props)
+    
+    plt.tight_layout()
+    plt.show()
+
