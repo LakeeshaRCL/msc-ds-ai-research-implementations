@@ -1,7 +1,7 @@
 import os
 import tensorflow as tf
 from tensorflow.keras import mixed_precision
-import globals.hyperparmeter_optimizer as hyp_optimizer
+import globals.hyperparameter_optimizer as hyp_optimizer
 from sklearn.model_selection import StratifiedKFold
 import globals.model_evaluations as evaluations
 import numpy as np

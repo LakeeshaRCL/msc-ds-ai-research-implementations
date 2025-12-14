@@ -15,7 +15,8 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
     precision_recall_fscore_support,
-average_precision_score
+    average_precision_score,
+    precision_recall_curve
 )
 import matplotlib.pyplot as plt
 
@@ -405,4 +406,53 @@ def classification_metrics(y_true, y_prob, threshold=0.5):
         "f1": float(f1),
         "roc_auc": float(roc_auc_score(y_true, y_prob)),
         "auprc": float(average_precision_score(y_true, y_prob)),
+    }
+
+
+def find_optimal_threshold(y_true, y_prob):
+    """
+    Find the optimal decision threshold that maximizes the F1 score.
+    
+    Parameters:
+    -----------
+    y_true : array-like
+        True binary labels
+    y_prob : array-like
+        Predicted probabilities for the positive class
+        
+    Returns:
+    --------
+    best_threshold : float
+        Threshold that maximizes F1 score
+    best_f1 : float
+        The maximum F1 score achieved
+    metrics : dict
+        Dictionary containing precision, recall, and f1 at the best threshold
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+    
+    # Calculate F1 for each threshold
+    # Note: precision_recall_curve returns precisions and recalls with length = len(thresholds) + 1
+    # The last precision and recall values are 1.0 and 0.0 respectively, which don't have a corresponding threshold.
+    # We ignore the last value for calculation with thresholds.
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        f1_scores = 2 * (precisions * recalls) / (precisions + recalls)
+    
+    # Handle NaN values that might arise from division by zero
+    f1_scores = np.nan_to_num(f1_scores)
+    
+    # Find the index of the maximum F1 score
+    # We only look at the first len(thresholds) indices
+    best_idx = np.argmax(f1_scores[:-1])
+    best_threshold = thresholds[best_idx]
+    best_f1 = f1_scores[best_idx]
+    
+    best_precision = precisions[best_idx]
+    best_recall = recalls[best_idx]
+    
+    return best_threshold, best_f1, {
+        "precision": float(best_precision),
+        "recall": float(best_recall),
+        "f1": float(best_f1)
     }
