@@ -127,95 +127,106 @@ class ManualBCELoss(nn.Module):
         return torch.mean(loss)
 
 
-def set_optimizer_objective(X, y, cv, max_epochs, batch_size, seed, early_stopping_patience):
+def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience):
     """
-    Build the objective: minimize (1 - mean F1 across CV folds).
+    Build the objective: minimize (1 - F1 on validation set).
     """
-    # Ensure X and y are numpy arrays
-    if not isinstance(X, np.ndarray):
-        X = np.array(X)
-    if not isinstance(y, np.ndarray):
-        y = np.array(y)
+    # Ensure inputs are numpy arrays
+    if not isinstance(X_train, np.ndarray):
+        X_train = np.array(X_train)
+    if not isinstance(y_train, np.ndarray):
+        y_train = np.array(y_train)
+    if not isinstance(X_val, np.ndarray):
+        X_val = np.array(X_val)
+    if not isinstance(y_val, np.ndarray):
+        y_val = np.array(y_val)
 
-    splits = list(StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed).split(np.zeros_like(y), y))
     device = select_device()
+    print(f"Optimizer using device: {device}")
+    
+    # PERFORMANCE FIX: Move ENTIRE dataset to GPU upfront
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
+    y_val_t = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1).to(device)
+    
+    # Pre-calculate class weights
+    num_pos = (y_train == 1).sum()
+    num_neg = (y_train == 0).sum()
+    pos_weight = num_neg / num_pos if num_pos > 0 else 1.0
+    
+    # For manual batching
+    n_samples = len(X_train_t)
 
     def obj(vec):
         hp = hyp_optimizer.optimizer_vectors_to_mlp_hyperparams(vec)
-        f1_scores = []
         
-        for tr_idx, va_idx in splits:
-            X_tr, y_tr = X[tr_idx], y[tr_idx]
-            X_va, y_va = X[va_idx], y[va_idx]
-
-            # Convert to tensors
-            X_tr_t = torch.tensor(X_tr, dtype=torch.float32)
-            y_tr_t = torch.tensor(y_tr, dtype=torch.float32).unsqueeze(1)
-            X_va_t = torch.tensor(X_va, dtype=torch.float32)
-            y_va_t = torch.tensor(y_va, dtype=torch.float32).unsqueeze(1)
-
-            # Create DataLoaders
-            train_dataset = torch.utils.data.TensorDataset(X_tr_t, y_tr_t)
-            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        # Build model
+        model = build_mlp_model(hp, X_train.shape[1], lr=0.001)
+        model.to(device)
+        
+        optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
+        loss_fn = ManualBCELoss(pos_weight=pos_weight)
+        
+        # Training loop w/ early stopping
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
+        
+        for epoch in range(max_epochs):
+            model.train()
             
-            # Build model
-            model = build_mlp_model(hp, X.shape[1], lr=0.001)
-            model.to(device)
+            # Manual shuffling and batching to avoid DataLoader overhead/GPU item access
+            # Generate random permutation on CPU, then use to index GPU tensors
+            perm = torch.randperm(n_samples) # CPU tensor is fine for indexing
             
-            # Calculate class weights for this fold
-            num_pos = (y_tr == 1).sum()
-            num_neg = (y_tr == 0).sum()
-            pos_weight = num_neg / num_pos if num_pos > 0 else 1.0
-            
-            optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
-            loss_fn = ManualBCELoss(pos_weight=pos_weight)
-            
-            # Training loop with early stopping
-            best_val_loss = float('inf')
-            patience_counter = 0
-            best_model_state = None
-            
-            for epoch in range(max_epochs):
-                model.train()
-                for X_batch, y_batch in train_loader:
-                    X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            for i in range(0, n_samples, batch_size):
+                indices = perm[i : i + batch_size]
+                
+                # Check for last batch
+                if len(indices) == 0:
+                    continue
                     
-                    optimizer.zero_grad()
-                    outputs = model(X_batch)
-                    loss = loss_fn(outputs, y_batch)
-                    loss.backward()
-                    optimizer.step()
+                # Indexing GPU tensor with CPU indices works in PyTorch and is efficient (gather)
+                X_batch = X_train_t[indices]
+                y_batch = y_train_t[indices]
                 
-                # Validation
-                model.eval()
-                with torch.no_grad():
-                    X_va_dev = X_va_t.to(device)
-                    y_va_dev = y_va_t.to(device)
-                    val_outputs = model(X_va_dev)
-                    val_loss = loss_fn(val_outputs, y_va_dev).item()
-                
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                    best_model_state = model.state_dict()
-                else:
-                    patience_counter += 1
-                    if patience_counter >= early_stopping_patience:
-                        break
+                optimizer.zero_grad()
+                outputs = model(X_batch)
+                loss = loss_fn(outputs, y_batch)
+                loss.backward()
+                optimizer.step()
             
-            # Restore best model
-            if best_model_state:
-                model.load_state_dict(best_model_state)
-            
-            # Evaluate F1
+            # Validation
             model.eval()
             with torch.no_grad():
-                X_va_dev = X_va_t.to(device)
-                y_prob = model(X_va_dev).cpu().numpy().ravel()
-                
-            f1_scores.append(evaluations.classification_metrics(y_va, y_prob, threshold=0.5)["f1"])
-
-        return 1.0 - float(np.mean(f1_scores))
+                val_outputs = model(X_val_t)
+                val_loss = loss_fn(val_outputs, y_val_t).item()
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_model_state = model.state_dict()
+            else:
+                patience_counter += 1
+                if patience_counter >= early_stopping_patience:
+                    break
+        
+        # Restore best model
+        if best_model_state:
+            model.load_state_dict(best_model_state)
+        
+        # Evaluate F1 on validation set
+        model.eval()
+        with torch.no_grad():
+            y_prob = model(X_val_t).cpu().numpy().ravel()
+            
+        f1_score = evaluations.classification_metrics(y_val, y_prob, threshold=0.5)["f1"]
+        
+        # Optional: print progress dot
+        print(".", end="", flush=True) 
+        
+        return 1.0 - float(f1_score)
 
     return obj
 
@@ -235,19 +246,17 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
         best_hp = best_hp[2]
 
     device = select_device()
+    print(f"Retraining on device: {device}")
     
-    # Convert data to tensors
-    X_train_t = torch.tensor(X_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+    # Convert data to tensors and move to GPU upfront (Fix for DirectML performance/crash)
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
     
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
-    y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device)
     
     # Train on Full X_train
     # Use X_test as validation set for early stopping
-    
-    train_dataset = torch.utils.data.TensorDataset(X_train_t, y_train_t)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
     model = build_mlp_model(best_hp, X_train.shape[1], lr=0.001)
     model.to(device)
@@ -264,10 +273,20 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     patience_counter = 0
     best_model_state = None
     
+    n_samples = len(X_train_t)
+    
     for epoch in range(max_epochs):
         model.train()
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        
+        # Manual batching
+        perm = torch.randperm(n_samples)
+        
+        for i in range(0, n_samples, batch_size):
+            indices = perm[i : i + batch_size]
+            if len(indices) == 0: continue
+            
+            X_batch = X_train_t[indices]
+            y_batch = y_train_t[indices]
             
             optimizer.zero_grad()
             outputs = model(X_batch)
@@ -278,10 +297,9 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
         # Validation on TEST SET
         model.eval()
         with torch.no_grad():
-            X_va_dev = X_test_t.to(device)
-            y_va_dev = y_test_t.to(device)
-            val_outputs = model(X_va_dev)
-            val_loss = loss_fn(val_outputs, y_va_dev).item()
+            # Full batch inference on validation (fast on GPU)
+            val_outputs = model(X_test_t)
+            val_loss = loss_fn(val_outputs, y_test_t).item()
             
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -298,8 +316,7 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     # Evaluate on test set
     model.eval()
     with torch.no_grad():
-        X_test_dev = X_test_t.to(device)
-        y_prob = model(X_test_dev).cpu().numpy().ravel()
+        y_prob = model(X_test_t).cpu().numpy().ravel()
         
     
     # Calculate metrics with default threshold 0.5
@@ -359,16 +376,12 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
     device = select_device()
     print(f"Training on device: {device}")
     
-    # Convert data to tensors
-    X_train_t = torch.tensor(X_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+    # Convert data to tensors and move to GPU
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
     
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
-    y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
-    
-    # Dataset and Loader
-    train_dataset = torch.utils.data.TensorDataset(X_train_t, y_train_t)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device)
     
     # Build model
     model = build_mlp_model(best_hp, X_train.shape[1], lr=0.001)
@@ -389,13 +402,22 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
     
     print(f"\nStarting training for {max_epochs} epochs (patience={early_stopping_patience})...")
     
+    n_samples = len(X_train_t)
+    
     for epoch in range(max_epochs):
         model.train()
         train_loss_accum = 0.0
         batches = 0
         
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        # Manual batching
+        perm = torch.randperm(n_samples)
+        
+        for i in range(0, n_samples, batch_size):
+            indices = perm[i : i + batch_size]
+            if len(indices) == 0: continue
+            
+            X_batch = X_train_t[indices]
+            y_batch = y_train_t[indices]
             
             optimizer.zero_grad()
             outputs = model(X_batch)
@@ -411,10 +433,8 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
         # Validation
         model.eval()
         with torch.no_grad():
-            X_va_dev = X_test_t.to(device)
-            y_va_dev = y_test_t.to(device)
-            val_outputs = model(X_va_dev)
-            val_loss = loss_fn(val_outputs, y_va_dev).item()
+            val_outputs = model(X_test_t)
+            val_loss = loss_fn(val_outputs, y_test_t).item()
             
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -447,8 +467,7 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
     # Final Evaluation
     model.eval()
     with torch.no_grad():
-        X_test_dev = X_test_t.to(device)
-        y_prob = model(X_test_dev).cpu().numpy().ravel()
+        y_prob = model(X_test_t).cpu().numpy().ravel()
         
     print("\nEvaluating final model...")
     
