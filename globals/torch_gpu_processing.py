@@ -269,12 +269,15 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
         # Evaluate F1 on validation set (Batched)
         y_prob = batched_inference(model, X_val_t, batch_size)
             
-        f1_score = evaluations.classification_metrics(y_val, y_prob, threshold=0.5)["f1"]
+        # Use optimal threshold for the objective
+        # This allows the optimizer to find models that have high potential F1, 
+        # even if they are not perfectly calibrated to 0.5 yet.
+        _, best_f1, _ = evaluations.find_optimal_threshold(y_val, y_prob)
         
         # Optional: print progress dot
         print(".", end="", flush=True) 
         
-        return 1.0 - float(f1_score)
+        return 1.0 - float(best_f1)
 
     return obj
 
