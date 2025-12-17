@@ -15,11 +15,64 @@ warnings.filterwarnings("ignore", message=r".*aten::elu.*")
 
 def select_device():
     return torch_directml.device()
+
 def test_gpu_processing():
     print(torch.__version__)
     print("CUDA available:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("Device:", torch.cuda.get_device_name(0))
+
+def batched_inference(model: nn.Module, X_tensor: torch.Tensor, batch_size: int = 1024) -> np.ndarray:
+    """
+    Perform inference in batches to avoid OOM on large datasets.
+    Returns: numpy array of probabilities.
+    """
+    model.eval()
+    probs_list = []
+    n_samples = len(X_tensor)
+    
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            batch = X_tensor[i : i + batch_size]
+            outputs = model(batch)
+            probs_list.append(outputs.cpu().numpy())
+            
+    if not probs_list:
+        return np.array([])
+        
+    return np.concatenate(probs_list).ravel()
+
+def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: torch.Tensor, 
+                          loss_fn: nn.Module, batch_size: int = 1024) -> float:
+    """
+    Compute validation loss in batches.
+    Returns: average loss (scalar).
+    """
+    model.eval()
+    total_loss = 0.0
+    n_samples = len(X_tensor)
+    batches = 0
+    
+    # Check for empty input
+    if n_samples == 0:
+        return 0.0
+
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            X_batch = X_tensor[i : i + batch_size]
+            y_batch = y_tensor[i : i + batch_size]
+            
+            outputs = model(X_batch)
+            # ManualBCELoss returns mean, so we should multiply by batch size to accumulate 
+            # if we wanted exact mean over dataset, but for validation monitoring, 
+            # averaging batch means is usually "good enough" if batches are roughly equal size.
+            # However, for accuracy, let's do weighted average.
+            batch_loss = loss_fn(outputs, y_batch).item()
+            total_loss += batch_loss * len(X_batch)
+            batches += 1
+            
+    return total_loss / n_samples
+
 
 def test_direct_ml_processing():
     print("torch:", torch.__version__)
@@ -197,11 +250,8 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
                 loss.backward()
                 optimizer.step()
             
-            # Validation
-            model.eval()
-            with torch.no_grad():
-                val_outputs = model(X_val_t)
-                val_loss = loss_fn(val_outputs, y_val_t).item()
+            # Validation (Batched)
+            val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -216,10 +266,8 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
         if best_model_state:
             model.load_state_dict(best_model_state)
         
-        # Evaluate F1 on validation set
-        model.eval()
-        with torch.no_grad():
-            y_prob = model(X_val_t).cpu().numpy().ravel()
+        # Evaluate F1 on validation set (Batched)
+        y_prob = batched_inference(model, X_val_t, batch_size)
             
         f1_score = evaluations.classification_metrics(y_val, y_prob, threshold=0.5)["f1"]
         
@@ -294,12 +342,8 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
             loss.backward()
             optimizer.step()
         
-        # Validation on TEST SET
-        model.eval()
-        with torch.no_grad():
-            # Full batch inference on validation (fast on GPU)
-            val_outputs = model(X_test_t)
-            val_loss = loss_fn(val_outputs, y_test_t).item()
+        # Validation on TEST SET (Batched)
+        val_loss = batched_validation_loss(model, X_test_t, y_test_t, loss_fn, batch_size)
             
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -313,10 +357,8 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     if best_model_state:
         model.load_state_dict(best_model_state)
         
-    # Evaluate on test set
-    model.eval()
-    with torch.no_grad():
-        y_prob = model(X_test_t).cpu().numpy().ravel()
+    # Evaluate on test set (Batched)
+    y_prob = batched_inference(model, X_test_t, batch_size)
         
     
     # Calculate metrics with default threshold 0.5
@@ -430,11 +472,8 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
             
         avg_train_loss = train_loss_accum / batches if batches > 0 else 0
         
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            val_outputs = model(X_test_t)
-            val_loss = loss_fn(val_outputs, y_test_t).item()
+        # Validation (Batched)
+        val_loss = batched_validation_loss(model, X_test_t, y_test_t, loss_fn, batch_size)
             
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -464,10 +503,8 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
         except Exception as e:
             print(f"Error saving model to {save_path}: {e}")
 
-    # Final Evaluation
-    model.eval()
-    with torch.no_grad():
-        y_prob = model(X_test_t).cpu().numpy().ravel()
+    # Final Evaluation (Batched)
+    y_prob = batched_inference(model, X_test_t, batch_size)
         
     print("\nEvaluating final model...")
     
