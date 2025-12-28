@@ -7,6 +7,8 @@ import globals.hyperparameter_optimizer as hyp_optimizer
 import globals.model_evaluations as evaluations
 import torch.utils.data
 import warnings
+import time
+
 
 # Suppress DirectML CPU fallback warnings explicitly for cleaner logs
 # Using regex to ensure we match the message correctly
@@ -34,13 +36,14 @@ def batched_inference(model: nn.Module, X_tensor: torch.Tensor, batch_size: int 
     with torch.no_grad():
         for i in range(0, n_samples, batch_size):
             batch = X_tensor[i : i + batch_size]
+            batch = X_tensor[i : i + batch_size]
             outputs = model(batch)
-            probs_list.append(outputs.cpu().numpy())
+            probs_list.append(outputs)
             
     if not probs_list:
         return np.array([])
         
-    return np.concatenate(probs_list).ravel()
+    return torch.cat(probs_list).cpu().numpy().ravel()
 
 def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: torch.Tensor, 
                           loss_fn: nn.Module, batch_size: int = 1024) -> float:
@@ -49,29 +52,23 @@ def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: 
     Returns: average loss (scalar).
     """
     model.eval()
-    total_loss = 0.0
+    # Initialize accumulator on the correct device
+    total_loss = torch.tensor(0.0, device=X_tensor.device)
     n_samples = len(X_tensor)
-    batches = 0
     
-    # Check for empty input
-    if n_samples == 0:
-        return 0.0
-
     with torch.no_grad():
         for i in range(0, n_samples, batch_size):
             X_batch = X_tensor[i : i + batch_size]
             y_batch = y_tensor[i : i + batch_size]
             
             outputs = model(X_batch)
-            # ManualBCELoss returns mean, so we should multiply by batch size to accumulate 
-            # if we wanted exact mean over dataset, but for validation monitoring, 
-            # averaging batch means is usually "good enough" if batches are roughly equal size.
-            # However, for accuracy, let's do weighted average.
-            batch_loss = loss_fn(outputs, y_batch).item()
+            # Loss function returns a tensor scalar (mean). 
+            # Accumulate on device.
+            batch_loss = loss_fn(outputs, y_batch)
             total_loss += batch_loss * len(X_batch)
-            batches += 1
             
-    return total_loss / n_samples
+    # Single sync at the end
+    return total_loss.item() / n_samples
 
 
 def test_direct_ml_processing():
@@ -197,16 +194,34 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
     device = select_device()
     print(f"Optimizer using device: {device}")
     
+    # Ensure labels are 2D (N, 1) correctly regardless of input type
+    y_train_flat = np.array(y_train).flatten()
+    y_val_flat = np.array(y_val).flatten()
+
+    # PERFORMANCE OPTIMIZATION: Downsample Validation Set for Hyperparameter Tuning
+    # Evaluating 118k samples every epoch is expensive. Limit to 30k for optimization speed.
+    if len(X_val) > 10000:
+        print(f"Downsampling validation set from {len(X_val)} to 10000 for optimization speed.")
+        np.random.seed(seed)
+        val_indices = np.random.choice(len(X_val), size=10000, replace=False)
+        X_val = X_val[val_indices]
+        y_val_flat = y_val_flat[val_indices]
+        
+    print(f"Final Optimization Validation Size: {len(X_val)}")
+    
     # PERFORMANCE FIX: Move ENTIRE dataset to GPU upfront
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+    y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
-    y_val_t = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1).to(device)
+    y_val_t = torch.tensor(y_val_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
-    # Pre-calculate class weights
-    num_pos = (y_train == 1).sum()
-    num_neg = (y_train == 0).sum()
-    pos_weight = num_neg / num_pos if num_pos > 0 else 1.0
+    print(f"DEBUG: Optimizer Data Shapes -> Train: {X_train_t.shape}, Val: {X_val_t.shape}")
+
+    
+    # Pre-calculate class weights robustly
+    num_pos = (y_train_flat == 1).sum()
+    num_neg = (y_train_flat == 0).sum()
+    pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
     
     # For manual batching
     n_samples = len(X_train_t)
@@ -226,7 +241,11 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
         patience_counter = 0
         best_model_state = None
         
+        best_model_state = None
+        
+        start_time = time.time()
         for epoch in range(max_epochs):
+
             model.train()
             
             # Manual shuffling and batching to avoid DataLoader overhead/GPU item access
@@ -253,6 +272,10 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
             # Validation (Batched)
             val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
             
+            
+            # Print dot for epoch progress (visual feedback)
+            print(".", end="", flush=True)
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
@@ -262,6 +285,9 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
                 if patience_counter >= early_stopping_patience:
                     break
         
+        train_duration = time.time() - start_time
+        print(f" {train_duration:.1f}s]", end="")
+
         # Restore best model
         if best_model_state:
             model.load_state_dict(best_model_state)
@@ -272,12 +298,15 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
         # Use optimal threshold for the objective
         # This allows the optimizer to find models that have high potential F1, 
         # even if they are not perfectly calibrated to 0.5 yet.
-        _, best_f1, _ = evaluations.find_optimal_threshold(y_val, y_prob)
-        
-        # Optional: print progress dot
-        print(".", end="", flush=True) 
+        _, best_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob)
         
         return 1.0 - float(best_f1)
+
+    # Force garbage collection to help DirectML
+    import gc
+    gc.collect()
+
+
 
     return obj
 
@@ -299,12 +328,15 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     device = select_device()
     print(f"Retraining on device: {device}")
     
-    # Convert data to tensors and move to GPU upfront (Fix for DirectML performance/crash)
+    # Convert data to tensors and move to GPU upfront
+    y_train_flat = np.array(y_train).flatten()
+    y_test_flat = np.array(y_test).flatten()
+
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+    y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
-    y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device)
+    y_test_t = torch.tensor(y_test_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
     # Train on Full X_train
     # Use X_test as validation set for early stopping
@@ -313,9 +345,9 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     model.to(device)
     
     # Calculate class weights from training data
-    num_pos = (y_train == 1).sum()
-    num_neg = (y_train == 0).sum()
-    pos_weight = num_neg / num_pos if num_pos > 0 else 1.0
+    num_pos = (y_train_flat == 1).sum()
+    num_neg = (y_train_flat == 0).sum()
+    pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
     
     optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
     loss_fn = ManualBCELoss(pos_weight=pos_weight)
@@ -421,21 +453,24 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
     device = select_device()
     print(f"Training on device: {device}")
     
-    # Convert data to tensors and move to GPU
+    # Convert data to tensors and move to GPU upfront
+    y_train_flat = np.array(y_train).flatten()
+    y_test_flat = np.array(y_test).flatten()
+
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+    y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
-    y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device)
+    y_test_t = torch.tensor(y_test_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
     # Build model
     model = build_mlp_model(best_hp, X_train.shape[1], lr=0.001)
     model.to(device)
     
     # Class weights
-    num_pos = (y_train == 1).sum()
-    num_neg = (y_train == 0).sum()
-    pos_weight = num_neg / num_pos if num_pos > 0 else 1.0
+    num_pos = (y_train_flat == 1).sum()
+    num_neg = (y_train_flat == 0).sum()
+    pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
     print(f"Using positive class weight: {pos_weight:.4f}")
     
     optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)

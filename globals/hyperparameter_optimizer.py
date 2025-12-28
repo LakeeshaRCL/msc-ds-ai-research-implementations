@@ -81,25 +81,25 @@ def optimizer_vectors_to_mlp_hyperparams(vector):
             
         # Units
         u_val = vector[current_idx]
-        if isinstance(u_val, (float, np.floating)):
-             idx = int(np.round(u_val))
-        else:
-             idx = int(u_val)
         
-        # Map index to actual unit count
-        idx = np.clip(idx, 0, len(hidden_layer_unit_choices) - 1)
-        u_val = hidden_layer_unit_choices[idx]
+        # If the value is not directly in choices, it might be a float index from some optimizers
+        if u_val not in hidden_layer_unit_choices:
+            if isinstance(u_val, (int, float, np.number)):
+                idx = int(np.round(u_val))
+                idx = np.clip(idx, 0, len(hidden_layer_unit_choices) - 1)
+                u_val = hidden_layer_unit_choices[idx]
         
-        units_per_layer.append(u_val)
+        units_per_layer.append(int(u_val))
         
         # Activation
         a_val = vector[current_idx + 1]
         
-        # If numeric, assume index mapping
-        if isinstance(a_val, (int, float, np.number)):
-            idx = int(np.round(a_val))
-            idx = np.clip(idx, 0, len(activation_functions) - 1)
-            a_val = activation_functions[idx]
+        if a_val not in activation_functions:
+            # If numeric, assume index mapping
+            if isinstance(a_val, (int, float, np.number)):
+                idx = int(np.round(a_val))
+                idx = np.clip(idx, 0, len(activation_functions) - 1)
+                a_val = activation_functions[idx]
         
         activations.append(a_val)
         
