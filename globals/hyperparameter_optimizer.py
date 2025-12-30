@@ -191,3 +191,164 @@ def run_hyperparam_optimization(algorithm, objective, iterations, population, mi
     print("Best hyperparameters:", best_hp)
 
     return best_vec, best_obj, best_hp, epoch_logs
+
+def get_ae_hyperparameter_bounds_config(min_layers=1, max_layers=4):
+    """
+    Returns a list of dicts defining the bounds for the AE optimizer vector.
+    Parameters:
+        min_layers, max_layers: Bounds for *encoder* and *decoder* depth separately.
+    """
+    # 1. Global Arch Params
+    bounds_config = [
+        {"type": "int", "name": "n_encoder_layers", "lb": min_layers, "ub": max_layers},
+        {"type": "int", "name": "n_decoder_layers", "lb": min_layers, "ub": max_layers},
+        {"type": "categorical", "name": "latent_size", "choices": [4, 8, 12, 16, 20, 24, 32, 64]}, # Bottleneck
+        {"type": "float", "name": "dropout_rate", "lb": 0.0, "ub": 0.5},
+        {"type": "bool", "name": "batch_norm"},
+    ]
+    
+    # 2. Dynamic Layer Params (Allocating max slots for both Enc and Dec)
+    # We will use the same pool of choices as MLP
+    for i in range(max_layers):
+        # Encoder Layer i
+        bounds_config.append({
+            "type": "categorical", 
+            "name": f"units_enc_{i+1}", 
+            "choices": hidden_layer_unit_choices
+        })
+        bounds_config.append({
+            "type": "categorical", 
+            "name": f"act_enc_{i+1}", 
+            "choices": activation_functions
+        })
+        
+        # Decoder Layer i
+        bounds_config.append({
+            "type": "categorical", 
+            "name": f"units_dec_{i+1}", 
+            "choices": hidden_layer_unit_choices
+        })
+        bounds_config.append({
+            "type": "categorical", 
+            "name": f"act_dec_{i+1}", 
+            "choices": activation_functions
+        })
+        
+    return bounds_config
+
+def optimizer_vectors_to_ae_hyperparams(vector):
+    """
+    Decode the optimizer's continuous vector into AE architecture.
+    """
+    # 1. Decode Fixed Params
+    # Indices: 0:n_enc, 1:n_dec, 2:latent, 3:dropout, 4:bn
+    
+    n_encoder = int(round(decode_scalar(vector[0], {"low": 1, "high": 4}))) # Bounds assumed from default
+    n_decoder = int(round(decode_scalar(vector[1], {"low": 1, "high": 4})))
+    
+    # Latent size (Categorical)
+    # If vector value is not in choices, treat as index or map closest
+    latent_choices = [4, 8, 12, 16, 20, 24, 32, 64]
+    
+    latent_val = vector[2]
+    if latent_val in latent_choices:
+        latent_size = int(latent_val)
+    else:
+        # Map float to index
+        idx = int(np.clip(round(latent_val), 0, len(latent_choices)-1))
+        # Depending on optimizer, it might pass the value directly if it learned it, or an index.
+        # Mealpy usually passes the value for categorical if configured right, but let's be safe.
+        # Ideally we should use the same decoding logic as MLP which seemed to handle it dynamically
+        # But here I'll just be robust.
+        if latent_val < 0.9 and latent_val > -0.1: # Likely normalized or index? safely assume index if small
+             latent_size = latent_choices[idx]
+        else:
+             # Try to find closest
+             latent_size = min(latent_choices, key=lambda x:abs(x-latent_val))
+
+    dropout = float(np.clip(vector[3], 0.0, 0.5))
+    batch_norm = bool(round(vector[4]))
+    
+    # 2. Decode Dynamic Layers
+    # Start after fixed params
+    current_idx = 5
+    
+    enc_units = []
+    enc_acts = []
+    dec_units = []
+    dec_acts = []
+    
+    # Max layers assumed 4 for decoding loop safety, or we just loop until we run out of vector
+    # Detailed mapping: For each of MAX layers, we have (Units, Act) for Enc, then (Units, Act) for Dec?
+    # No, the bounds config order was: Enc1, Act1, Dec1, Act1 ... (interleaved? No, loop says Enc then Dec)
+    # Loop was: for i in range(max): append Enc_i, append Act_i, append Dec_i, append Act_i
+    
+    # We need to know max_layers to decode correctly if we want to skip unused slots,
+    # OR we just read the slots we need based on n_encoder/n_decoder and ignore the rest?
+    # BUT the vector position is fixed. We MUST know the stride.
+    # We will assume max_layers=4 as per default in bounds config.
+    max_layers_assumed = 4 
+    
+    # Function to safe decode categorical
+    def get_cat(val, choices):
+        # 1. Exact match check
+        if val in choices: return val
+        
+        # 2. Index Fallback
+        # Map float to valid index range
+        idx = int(np.clip(round(val), 0, len(choices)-1))
+        
+        # 3. Check if choices are numeric
+        is_numeric = all(isinstance(c, (int, float, np.number)) for c in choices)
+        
+        if is_numeric:
+            # If numeric, we can use the "closest value" logic
+            # Be careful if val is clearly an index vs a value
+            # Heuristic: If val is float (e.g. 0.5) and choices are large ints [16, 32], assume index.
+            # But simpler is to assume Mealpy returns the mapped value if it can, or the raw bounds if not.
+            # For CategoricalVar, Mealpy often returns the VALUE if we access the variable, but the SOLUTION VECTOR is usually numbers.
+            # If the solution vector corresponds to the bound index, then 'val' is an index.
+            # Let's try the index first.
+            if val < len(choices) and val >= -0.5 and (val % 1 != 0 or val < 1.0):
+                 return choices[idx]
+                 
+            # Otherwise try distance
+            return min(choices, key=lambda x: abs(x - val))
+        else:
+            # If NOT numeric (e.g. strings), we MUST rely on index
+            return choices[idx]
+
+    for i in range(max_layers_assumed):
+        # Indices in loop: 
+        # Enc_Units: current_idx
+        # Enc_Act: current_idx + 1
+        # Dec_Units: current_idx + 2
+        # Dec_Act: current_idx + 3
+        
+        # Encoder Layer i
+        if i < n_encoder:
+            u = get_cat(vector[current_idx], hidden_layer_unit_choices)
+            a = get_cat(vector[current_idx+1], activation_functions)
+            enc_units.append(int(u))
+            enc_acts.append(a)
+            
+        # Decoder Layer i
+        if i < n_decoder:
+            u = get_cat(vector[current_idx+2], hidden_layer_unit_choices)
+            a = get_cat(vector[current_idx+3], activation_functions)
+            dec_units.append(int(u))
+            dec_acts.append(a)
+            
+        current_idx += 4
+        
+    return {
+        "n_encoder_layers": n_encoder,
+        "n_decoder_layers": n_decoder,
+        "latent_size": latent_size,
+        "encoder_units": enc_units,
+        "encoder_activations": enc_acts,
+        "decoder_units": dec_units,
+        "decoder_activations": dec_acts,
+        "dropout_rate": dropout,
+        "batch_norm": batch_norm
+    }

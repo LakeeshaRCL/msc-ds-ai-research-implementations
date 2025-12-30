@@ -565,3 +565,281 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
     print(f"  Recall:    {best_metrics['recall']:.4f}")
     
     return model, metrics
+
+
+# ==================================================================================
+# AUTOENCODER IMPLEMENTATION
+# ==================================================================================
+
+def build_ae_model(hyperparameters, input_shape):
+    """
+    Builds an Autoencoder model (Encoder -> Bottleneck -> Decoder).
+    Output dimension == Input dimension (input_shape).
+    """
+    device = select_device()
+    
+    # Extract params
+    n_enc = int(hyperparameters.get("n_encoder_layers", 1))
+    n_dec = int(hyperparameters.get("n_decoder_layers", 1))
+    latent_dim = int(hyperparameters.get("latent_size", 8))
+    
+    enc_units = hyperparameters.get("encoder_units", [])
+    enc_acts = hyperparameters.get("encoder_activations", [])
+    dec_units = hyperparameters.get("decoder_units", [])
+    dec_acts = hyperparameters.get("decoder_activations", [])
+    
+    dropout = float(hyperparameters.get("dropout_rate", 0.0))
+    use_bn = bool(hyperparameters.get("batch_norm", False))
+    
+    layers = []
+    
+    # --- ENCODER ---
+    in_dim = int(input_shape)
+    for i in range(n_enc):
+        out_dim = enc_units[i] if i < len(enc_units) else 64
+        act_name = enc_acts[i] if i < len(enc_acts) else "relu"
+        
+        layers.append(nn.Linear(in_dim, out_dim))
+        if use_bn:
+            layers.append(nn.BatchNorm1d(out_dim))
+        layers.append(get_torch_activation(act_name))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+            
+        in_dim = out_dim
+        
+    # --- BOTTLENECK ---
+    layers.append(nn.Linear(in_dim, latent_dim))
+    layers.append(nn.ReLU()) 
+    
+    # --- DECODER ---
+    in_dim = latent_dim
+    for i in range(n_dec):
+        out_dim = dec_units[i] if i < len(dec_units) else 64
+        act_name = dec_acts[i] if i < len(dec_acts) else "relu"
+        
+        layers.append(nn.Linear(in_dim, out_dim))
+        if use_bn:
+            layers.append(nn.BatchNorm1d(out_dim))
+        layers.append(get_torch_activation(act_name))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+            
+        in_dim = out_dim
+        
+    # --- OUTPUT LAYER ---
+    layers.append(nn.Linear(in_dim, int(input_shape)))
+    # Output activation: Identity (Linear) + MSE Loss.
+    
+    model = nn.Sequential(*layers)
+    model.to(device, dtype=torch.float32)
+    print(model)
+    return model
+
+def batched_reconstruction_loss(model, X_tensor, batch_size=1024):
+    """Calculate MSE reconstruction loss in batches."""
+    model.eval()
+    criterion = nn.MSELoss()
+    total_loss = torch.tensor(0.0, device=X_tensor.device)
+    n = len(X_tensor)
+    
+    with torch.no_grad():
+        for i in range(0, n, batch_size):
+            batch = X_tensor[i:i+batch_size]
+            recon = model(batch)
+            loss = criterion(recon, batch)
+            total_loss += loss * len(batch)
+            
+    return total_loss.item() / n
+
+def get_reconstruction_errors(model, X_tensor, batch_size=1024):
+    """Return squared error per sample: mean((X - Rec)^2, axis=1)"""
+    model.eval()
+    errors_list = []
+    n = len(X_tensor)
+    
+    with torch.no_grad():
+        for i in range(0, n, batch_size):
+            batch = X_tensor[i:i+batch_size]
+            recon = model(batch)
+            # squared difference per feature
+            # mean over features (axis 1)
+            batch_errors = torch.mean((batch - recon)**2, dim=1)
+            errors_list.append(batch_errors)
+            
+    return torch.cat(errors_list).cpu().numpy()
+
+def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience):
+    """
+    AE Objective: 
+    1. Train on X_train (Reconstruction).
+    2. Evaluate on X_val (Reconstruction Error thresholding -> F1).
+    3. Return (1 - Optimal F1).
+    """
+    device = select_device()
+    
+    # 1. Data Prep
+    # Validation downsampling for speed
+    if len(X_val) > 10000:
+        np.random.seed(seed)
+        idx = np.random.choice(len(X_val), size=10000, replace=False)
+        X_val_opt = X_val[idx]
+        y_val_opt = np.array(y_val).flatten()[idx]
+    else:
+        X_val_opt = X_val
+        y_val_opt = np.array(y_val).flatten()
+        
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(device)
+    y_val_t = torch.tensor(y_val_opt, dtype=torch.float32).to(device)
+    
+    n_samples = len(X_train_t)
+    
+    def obj(vec):
+        hp = hyp_optimizer.optimizer_vectors_to_ae_hyperparams(vec)
+        
+        # Build
+        model = build_ae_model(hp, X_train.shape[1])
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+        
+        best_val_loss = float('inf')
+        patience = 0
+        best_state = None
+        
+        # Train Loop (MSE)
+        for epoch in range(max_epochs):
+            model.train()
+            perm = torch.randperm(n_samples)
+            
+            for i in range(0, n_samples, batch_size):
+                idx = perm[i:i+batch_size]
+                if len(idx)==0: continue
+                batch = X_train_t[idx]
+                
+                optimizer.zero_grad()
+                recon = model(batch)
+                loss = criterion(recon, batch)
+                loss.backward()
+                optimizer.step()
+                
+            # Validation (MSE)
+            val_loss = batched_reconstruction_loss(model, X_val_t, batch_size)
+            
+            print(".", end="", flush=True)
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = model.state_dict()
+                patience = 0
+            else:
+                patience += 1
+                if patience >= early_stopping_patience:
+                    break
+        
+        print("]")
+        
+        # Restore best reconstruction model
+        if best_state:
+            model.load_state_dict(best_state)
+            
+        # Evaluation: Find Best F1 by Thresholding Reconstruction Error
+        recon_errors = get_reconstruction_errors(model, X_val_t, batch_size)
+        _, best_f1, _ = evaluations.find_optimal_threshold(y_val_opt, recon_errors)
+        
+        return 1.0 - best_f1
+        
+    import gc
+    gc.collect()
+    return obj
+
+def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=50, save_path=None):
+    """
+    Train final AE on full data, evaluate on Test.
+    """
+    print("="*60)
+    print("FINAL AE TRAINING")
+    print("="*60)
+    
+    if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
+        best_hp = best_hp[2]
+    
+    device = select_device()
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    
+    model = build_ae_model(best_hp, X_train.shape[1])
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
+    
+    n_samples = len(X_train_t)
+    best_val_loss = float('inf')
+    best_state = None
+    patience = 0
+    patience_limit = 10
+    
+    print(f"Training AE for max {max_epochs} epochs...")
+    
+    for epoch in range(max_epochs):
+        model.train()
+        perm = torch.randperm(n_samples)
+        train_loss = 0
+        batches = 0
+        
+        for i in range(0, n_samples, batch_size):
+            idx = perm[i:i+batch_size]
+            if len(idx)==0: continue
+            batch = X_train_t[idx]
+            
+            optimizer.zero_grad()
+            recon = model(batch)
+            loss = criterion(recon, batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            batches += 1
+            
+        avg_train = train_loss / batches if batches else 0
+        val_loss = batched_reconstruction_loss(model, X_test_t, batch_size)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = model.state_dict()
+            patience = 0
+            if epoch%5==0: print(f"Ep {epoch+1}: Train={avg_train:.6f}, Val={val_loss:.6f} *")
+        else:
+            patience +=1 
+            if epoch%5==0: print(f"Ep {epoch+1}: Train={avg_train:.6f}, Val={val_loss:.6f}")
+            if patience >= patience_limit:
+                print("Early stopping.")
+                break
+                
+    if best_state:
+        model.load_state_dict(best_state)
+        
+    if save_path:
+        torch.save(model.state_dict(), save_path)
+        print(f"Saved to {save_path}")
+        
+    # Evaluation
+    print("\nEvaluating AE Classification Performance...")
+    recon_errors = get_reconstruction_errors(model, X_test_t, batch_size)
+    y_test_flat = np.array(y_test).flatten()
+    
+    thresh, f1, metrics = evaluations.find_optimal_threshold(y_test_flat, recon_errors)
+    
+    print(f"Optimal Reconstruction Threshold: {thresh:.6f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall: {metrics['recall']:.4f}")
+    
+    # Calculate AUC
+    try:
+        from sklearn.metrics import roc_auc_score
+        auc = roc_auc_score(y_test_flat, recon_errors)
+        print(f"ROC AUC: {auc:.4f}")
+        metrics['roc_auc'] = auc
+    except: pass
+    
+    metrics['optimal_threshold'] = thresh
+    return model, metrics
