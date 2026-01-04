@@ -5,9 +5,10 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 import globals.hyperparameter_optimizer as hyp_optimizer
 import globals.model_evaluations as evaluations
-import torch.utils.data
+from torch.utils.data import DataLoader, TensorDataset
 import warnings
 import time
+import gc
 
 
 # Suppress DirectML CPU fallback warnings explicitly for cleaner logs
@@ -633,7 +634,7 @@ def build_ae_model(hyperparameters, input_shape):
     
     model = nn.Sequential(*layers)
     model.to(device, dtype=torch.float32)
-    print(model)
+    # print(model) # Reduced verbosity for optimization
     return model
 
 def batched_reconstruction_loss(model, X_tensor, batch_size=1024):
@@ -669,14 +670,20 @@ def get_reconstruction_errors(model, X_tensor, batch_size=1024):
             
     return torch.cat(errors_list).cpu().numpy()
 
-def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience):
+def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience, force_cpu=True):
     """
     AE Objective: 
     1. Train on X_train (Reconstruction).
     2. Evaluate on X_val (Reconstruction Error thresholding -> F1).
     3. Return (1 - Optimal F1).
     """
-    device = select_device()
+    if force_cpu:
+        device = torch.device('cpu')
+        print("Optimizer using CPU for stability on small samples.")
+    else:
+        device = select_device()
+        
+    display_device = device
     
     # 1. Data Prep
     # Validation downsampling for speed
@@ -689,44 +696,71 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
         X_val_opt = X_val
         y_val_opt = np.array(y_val).flatten()
         
-    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
-    X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(device)
-    y_val_t = torch.tensor(y_val_opt, dtype=torch.float32).to(device)
+    # Prepare Training DataLoader (CPU -> GPU stream)
+    # Using pin_memory=True enables faster host-to-device copy
+    # Construct TensorDataset from numpy
+    X_train_tensor = torch.from_numpy(X_train).float()
+    train_dataset = TensorDataset(X_train_tensor)
     
-    n_samples = len(X_train_t)
+    # Validation data can be smaller, so we might keep it on GPU or use loader
+    # For consistency and memory safety, let's use a loader or just move chunks
+    # Given optimization loop checks validation every epoch, let's pre-move validation to GPU if it fits
+    # 10k samples * 26 features * 4 bytes ~= 1MB. This is safe to keep on GPU.
+    X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(device)
+    # y_val_opt is needed for F1 (CPU side usually for sklearn, but find_optimal_threshold might need numpy)
     
     def obj(vec):
+        # Explicit garbage collection to prevent memory buildup in trials
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         hp = hyp_optimizer.optimizer_vectors_to_ae_hyperparams(vec)
         
         # Build
         model = build_ae_model(hp, X_train.shape[1])
+        model.to(device)
+        
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.MSELoss()
+        
+        # Create DataLoader per trial (shuffle changes)
+        # num_workers=0 for Windows DirectML safety (multiprocessing can be tricky)
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            pin_memory=False # Disabled for DirectML stability
+        )
         
         best_val_loss = float('inf')
         patience = 0
         best_state = None
         
-        # Train Loop (MSE)
+        # Train Loop
         for epoch in range(max_epochs):
+            epoch_start = time.time()
             model.train()
-            perm = torch.randperm(n_samples)
             
-            for i in range(0, n_samples, batch_size):
-                idx = perm[i:i+batch_size]
-                if len(idx)==0: continue
-                batch = X_train_t[idx]
+            for batch_data in train_loader:
+                # DataLoader returns a list/tuple of [features, target] or just [features]
+                # TensorDataset(X) returns (X,)
+                batch_x = batch_data[0].to(device, non_blocking=False)
                 
                 optimizer.zero_grad()
-                recon = model(batch)
-                loss = criterion(recon, batch)
+                recon = model(batch_x)
+                loss = criterion(recon, batch_x)
                 loss.backward()
                 optimizer.step()
                 
             # Validation (MSE)
+            # X_val_t is already on device
             val_loss = batched_reconstruction_loss(model, X_val_t, batch_size)
             
-            print(".", end="", flush=True)
+            # Time tracking
+            epoch_duration = time.time() - epoch_start
+            print(f"[{epoch+1}:{epoch_duration:.1f}s]", end="", flush=True)
+            # print(".", end="", flush=True)
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -744,13 +778,18 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
             model.load_state_dict(best_state)
             
         # Evaluation: Find Best F1 by Thresholding Reconstruction Error
-        recon_errors = get_reconstruction_errors(model, X_val_t, batch_size)
+        # Ensure we don't leak GPU memory here
+        with torch.no_grad():
+            recon_errors = get_reconstruction_errors(model, X_val_t, batch_size)
+        
         _, best_f1, _ = evaluations.find_optimal_threshold(y_val_opt, recon_errors)
+        
+        # Clean up model
+        del model
+        del optimizer
         
         return 1.0 - best_f1
         
-    import gc
-    gc.collect()
     return obj
 
 def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=50, save_path=None):
@@ -764,54 +803,68 @@ def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
     if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
         best_hp = best_hp[2]
     
-    device = select_device()
-    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    # device = select_device() # select_device called in build_ae_model
+    display_device = torch_directml.device() # or use select_device just to print
+    
+    # Prep DataLoader
+    X_train_tensor = torch.from_numpy(X_train).float()
+    train_dataset = TensorDataset(X_train_tensor)
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        pin_memory=True
+    )
+    
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(display_device)
     
     model = build_ae_model(best_hp, X_train.shape[1])
+    # model already moved to device in build_ae_model
+    device = next(model.parameters()).device
+    
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     
-    n_samples = len(X_train_t)
     best_val_loss = float('inf')
     best_state = None
     patience = 0
     patience_limit = 10
     
-    print(f"Training AE for max {max_epochs} epochs...")
+    print(f"Training AE for max {max_epochs} epochs on {device}...")
     
     for epoch in range(max_epochs):
         model.train()
-        perm = torch.randperm(n_samples)
-        train_loss = 0
+        train_loss = 0.0
         batches = 0
         
-        for i in range(0, n_samples, batch_size):
-            idx = perm[i:i+batch_size]
-            if len(idx)==0: continue
-            batch = X_train_t[idx]
+        for batch_data in train_loader:
+            batch_x = batch_data[0].to(device, non_blocking=True)
             
             optimizer.zero_grad()
-            recon = model(batch)
-            loss = criterion(recon, batch)
+            recon = model(batch_x)
+            loss = criterion(recon, batch_x)
             loss.backward()
             optimizer.step()
+            
             train_loss += loss.item()
             batches += 1
             
-        avg_train = train_loss / batches if batches else 0
+        avg_train_loss = train_loss / batches if batches > 0 else 0
+        
+        # Validation (Reconstruction Loss on Test/Validation set)
         val_loss = batched_reconstruction_loss(model, X_test_t, batch_size)
+        
+        print(f"Epoch {epoch+1}/{max_epochs}: Train Loss={avg_train_loss:.6f}, Val Loss={val_loss:.6f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = model.state_dict()
             patience = 0
-            if epoch%5==0: print(f"Ep {epoch+1}: Train={avg_train:.6f}, Val={val_loss:.6f} *")
         else:
-            patience +=1 
-            if epoch%5==0: print(f"Ep {epoch+1}: Train={avg_train:.6f}, Val={val_loss:.6f}")
+            patience += 1
             if patience >= patience_limit:
-                print("Early stopping.")
+                print("Early stopping triggered.")
                 break
                 
     if best_state:
@@ -819,7 +872,9 @@ def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
         
     if save_path:
         torch.save(model.state_dict(), save_path)
-        print(f"Saved to {save_path}")
+        print(f"Saved model to {save_path}")
+        
+
         
     # Evaluation
     print("\nEvaluating AE Classification Performance...")
