@@ -670,158 +670,226 @@ def get_reconstruction_errors(model, X_tensor, batch_size=1024):
             
     return torch.cat(errors_list).cpu().numpy()
 
-def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience, force_cpu=True):
+def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience, force_cpu=False):
     """
     AE Objective: 
     1. Train on X_train (Reconstruction).
     2. Evaluate on X_val (Reconstruction Error thresholding -> F1).
     3. Return (1 - Optimal F1).
     """
-    if force_cpu:
-        device = torch.device('cpu')
-        print("Optimizer using CPU for stability on small samples.")
+    # Use GPU by default unless strictly forced or unavailable
+    use_gpu = (not force_cpu) and (torch.cuda.is_available() or torch_directml.device() is not None)
+    
+    if use_gpu:
+        try:
+            device = select_device()
+            # DirectML is unstable for hyperparameter optimization loops (creates/destroys many models)
+            if device.type == 'privateuseone':
+                print(f"Optimizer detected DirectML ({device}).")
+                print("  ! DirectML is unstable for intensive optimization loops (causes hangs).")
+                print("  ! Falling back to CPU for STABILITY. (Expected runtime: ~20-40 mins)")
+                device = torch.device('cpu')
+            else:
+                print(f"Optimizer using DEVICE: {device}")
+        except:
+            device = torch.device('cpu')
+            print("Optimizer fell back to CPU due to device error.")
     else:
-        device = select_device()
+        device = torch.device('cpu')
+        print("Optimizer using CPU (Forced or No GPU found).")
         
     display_device = device
     
     # 1. Data Prep
-    # Validation downsampling for speed
-    if len(X_val) > 10000:
-        np.random.seed(seed)
-        idx = np.random.choice(len(X_val), size=10000, replace=False)
-        X_val_opt = X_val[idx]
-        y_val_opt = np.array(y_val).flatten()[idx]
+    # Validation downsampling for speed (Smart Sampling)
+    # Goal: Keep ALL Fraud cases (Class 1) to ensure F1/Recall signal is strong.
+    # Downsample only Non-Fraud (Class 0).
+    
+    # Ensure numpy
+    if isinstance(y_val, torch.Tensor):
+        y_val_np = y_val.cpu().numpy().flatten()
     else:
-        X_val_opt = X_val
-        y_val_opt = np.array(y_val).flatten()
+        y_val_np = np.array(y_val).flatten()
         
-    # Prepare Training DataLoader (CPU -> GPU stream)
-    # Using pin_memory=True enables faster host-to-device copy
-    # Construct TensorDataset from numpy
+    if isinstance(X_val, torch.Tensor):
+        X_val_np = X_val.cpu().numpy()
+    else:
+        X_val_np = np.array(X_val)
+    
+    total_val_limit = 20000 
+    
+    if len(X_val_np) > total_val_limit:
+        print(f"Smart Downsampling Validation Set (Limit: {total_val_limit})...")
+        
+        # Identify indices
+        fraud_indices = np.where(y_val_np == 1)[0]
+        normal_indices = np.where(y_val_np == 0)[0]
+        
+        n_fraud = len(fraud_indices)
+        n_normal_target = total_val_limit - n_fraud
+        
+        if n_normal_target < 1000: n_normal_target = 1000 # Minimum safety
+        
+        # Sample normal
+        np.random.seed(seed)
+        if len(normal_indices) > n_normal_target:
+            normal_indices = np.random.choice(normal_indices, size=n_normal_target, replace=False)
+            
+        # Combine
+        final_indices = np.concatenate([fraud_indices, normal_indices])
+        np.random.shuffle(final_indices) # Shuffle to mix
+        
+        X_val_opt = X_val_np[final_indices]
+        y_val_opt = y_val_np[final_indices]
+        
+        print(f"  - Original Size: {len(X_val_np)} (Fraud: {n_fraud})")
+        print(f"  - New Size: {len(X_val_opt)} (Fraud: {n_fraud} KEPT 100%)")
+    else:
+        X_val_opt = X_val_np
+        y_val_opt = y_val_np
+
+    # Prepare Training DataLoader
     X_train_tensor = torch.from_numpy(X_train).float()
     train_dataset = TensorDataset(X_train_tensor)
     
-    # Validation data can be smaller, so we might keep it on GPU or use loader
-    # For consistency and memory safety, let's use a loader or just move chunks
-    # Given optimization loop checks validation every epoch, let's pre-move validation to GPU if it fits
-    # 10k samples * 26 features * 4 bytes ~= 1MB. This is safe to keep on GPU.
-    X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(device)
-    # y_val_opt is needed for F1 (CPU side usually for sklearn, but find_optimal_threshold might need numpy)
+    # Check if validation fits in GPU memory (20k * 26 * 4 bytes < 3MB) -> Yes
+    X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(display_device)
+    
+    # Input Noise for Denoising AE (fixed level for robust search)
+    input_noise_std = 0.01 
     
     def obj(vec):
-        # Explicit garbage collection to prevent memory buildup in trials
+        # Explicit garbage collection
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
         hp = hyp_optimizer.optimizer_vectors_to_ae_hyperparams(vec)
         
-        # Build
-        model = build_ae_model(hp, X_train.shape[1])
-        model.to(device)
-        
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        criterion = nn.MSELoss()
-        
-        # Create DataLoader per trial (shuffle changes)
-        # num_workers=0 for Windows DirectML safety (multiprocessing can be tricky)
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True, 
-            pin_memory=False # Disabled for DirectML stability
-        )
-        
-        best_val_loss = float('inf')
-        patience = 0
-        best_state = None
-        
-        # Train Loop
-        for epoch in range(max_epochs):
-            epoch_start = time.time()
-            model.train()
+        try:
+            # Build
+            model = build_ae_model(hp, X_train.shape[1])
+            model.to(device)
             
-            for batch_data in train_loader:
-                # DataLoader returns a list/tuple of [features, target] or just [features]
-                # TensorDataset(X) returns (X,)
-                batch_x = batch_data[0].to(device, non_blocking=False)
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            criterion = nn.MSELoss()
+            
+            # Create DataLoader per trial
+            # DirectML (privateuseone) is unstable with pin_memory on Windows, so disable it there.
+            use_pin_memory = (device.type != 'cpu') and (device.type != 'privateuseone')
+            
+            train_loader = DataLoader(
+                train_dataset, 
+                batch_size=batch_size, 
+                shuffle=True, 
+                pin_memory=use_pin_memory, 
+                drop_last=True 
+            )
+            
+            best_val_loss = float('inf')
+            patience = 0
+            best_state = None
+            
+            # Train Loop
+            for epoch in range(max_epochs):
+                epoch_start = time.time()
+                model.train()
                 
-                optimizer.zero_grad()
-                recon = model(batch_x)
-                loss = criterion(recon, batch_x)
-                loss.backward()
-                optimizer.step()
+                for batch_data in train_loader:
+                    batch_x = batch_data[0].to(device, non_blocking=False)
+                    
+                    # Denoising: Add noise to input, reconstruct original
+                    if input_noise_std > 0:
+                        noise = torch.randn_like(batch_x) * input_noise_std
+                        noisy_x = batch_x + noise
+                    else:
+                        noisy_x = batch_x
+                    
+                    optimizer.zero_grad()
+                    recon = model(noisy_x)
+                    loss = criterion(recon, batch_x) # Reconstruct CLEAN input
+                    loss.backward()
+                    optimizer.step()
+                    
+                # Validation (MSE)
+                val_loss = batched_reconstruction_loss(model, X_val_t, batch_size)
                 
-            # Validation (MSE)
-            # X_val_t is already on device
-            val_loss = batched_reconstruction_loss(model, X_val_t, batch_size)
+                # Time tracking
+                epoch_duration = time.time() - epoch_start
+                print(f"[{epoch+1}:{epoch_duration:.1f}s]", end="", flush=True)
+                
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = model.state_dict()
+                    patience = 0
+                else:
+                    patience += 1
+                    if patience >= early_stopping_patience:
+                        break
             
-            # Time tracking
-            epoch_duration = time.time() - epoch_start
-            print(f"[{epoch+1}:{epoch_duration:.1f}s]", end="", flush=True)
-            # print(".", end="", flush=True)
+            print("]")
             
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = model.state_dict()
-                patience = 0
+            if best_state:
+                model.load_state_dict(best_state)
+                
+            # Evaluation
+            with torch.no_grad():
+                recon_errors = get_reconstruction_errors(model, X_val_t, batch_size)
+            
+            _, best_f1, _ = evaluations.find_optimal_threshold(y_val_opt, recon_errors)
+            
+            del model
+            del optimizer
+            return 1.0 - best_f1
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("| OOM caused by params, skipping trial |")
+                if hasattr(torch.cuda, 'empty_cache'): torch.cuda.empty_cache()
+                return 1.0 # Worst score
             else:
-                patience += 1
-                if patience >= early_stopping_patience:
-                    break
-        
-        print("]")
-        
-        # Restore best reconstruction model
-        if best_state:
-            model.load_state_dict(best_state)
-            
-        # Evaluation: Find Best F1 by Thresholding Reconstruction Error
-        # Ensure we don't leak GPU memory here
-        with torch.no_grad():
-            recon_errors = get_reconstruction_errors(model, X_val_t, batch_size)
-        
-        _, best_f1, _ = evaluations.find_optimal_threshold(y_val_opt, recon_errors)
-        
-        # Clean up model
-        del model
-        del optimizer
-        
-        return 1.0 - best_f1
+                print(f"Error in trial: {e}")
+                return 1.0
         
     return obj
 
-def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=50, save_path=None):
+def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=100, save_path=None):
     """
     Train final AE on full data, evaluate on Test.
     """
     print("="*60)
-    print("FINAL AE TRAINING")
+    print(f"FINAL AE TRAINING (Max Epochs: {max_epochs})")
     print("="*60)
     
     if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
         best_hp = best_hp[2]
     
-    # device = select_device() # select_device called in build_ae_model
-    display_device = torch_directml.device() # or use select_device just to print
+    # Use robust device selection
+    try:
+        display_device = select_device()
+    except:
+        display_device = torch.device('cpu')
     
     # Prep DataLoader
     X_train_tensor = torch.from_numpy(X_train).float()
     train_dataset = TensorDataset(X_train_tensor)
     
+    display_device_type = display_device.type
+    use_pin_memory = (display_device_type != 'cpu') and (display_device_type != 'privateuseone')
+
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
-        pin_memory=True
+        pin_memory=use_pin_memory, # Enable pinned memory only for CUDA/CPU, avoid DirectML
+        drop_last=True   
     )
     
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(display_device)
     
     model = build_ae_model(best_hp, X_train.shape[1])
-    # model already moved to device in build_ae_model
-    device = next(model.parameters()).device
+    model.to(display_device)
+    device = display_device
     
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
@@ -831,7 +899,13 @@ def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
     patience = 0
     patience_limit = 10
     
-    print(f"Training AE for max {max_epochs} epochs on {device}...")
+    train_losses = []
+    val_losses = []
+    
+    # Input Noise for Denoising AE (Must match optimization)
+    input_noise_std = 0.01
+    
+    print(f"Training AE for max {max_epochs} epochs on {device} (DAE Noise: {input_noise_std})...")
     
     for epoch in range(max_epochs):
         model.train()
@@ -841,9 +915,16 @@ def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
         for batch_data in train_loader:
             batch_x = batch_data[0].to(device, non_blocking=True)
             
+            # Denoising: Add noise to input
+            if input_noise_std > 0:
+                noise = torch.randn_like(batch_x) * input_noise_std
+                noisy_x = batch_x + noise
+            else:
+                noisy_x = batch_x
+            
             optimizer.zero_grad()
-            recon = model(batch_x)
-            loss = criterion(recon, batch_x)
+            recon = model(noisy_x)
+            loss = criterion(recon, batch_x) # Reconstruct CLEAN input
             loss.backward()
             optimizer.step()
             
