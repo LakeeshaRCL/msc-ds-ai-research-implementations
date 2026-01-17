@@ -200,13 +200,18 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
     y_val_flat = np.array(y_val).flatten()
 
     # PERFORMANCE OPTIMIZATION: Downsample Validation Set for Hyperparameter Tuning
+    # Use stratified sampling to maintain class distribution
     # Evaluating 118k samples every epoch is expensive. Limit to 30k for optimization speed.
     if len(X_val) > 10000:
-        print(f"Downsampling validation set from {len(X_val)} to 10000 for optimization speed.")
-        np.random.seed(seed)
-        val_indices = np.random.choice(len(X_val), size=10000, replace=False)
-        X_val = X_val[val_indices]
-        y_val_flat = y_val_flat[val_indices]
+        print(f"Downsampling validation set from {len(X_val)} to 10000 for optimization speed (stratified sampling).")
+        from sklearn.model_selection import train_test_split
+        # Use stratified sampling to maintain class distribution
+        X_val, _, y_val_flat, _ = train_test_split(
+            X_val, y_val_flat,
+            train_size=10000,
+            stratify=y_val_flat,
+            random_state=seed
+        )
         
     print(f"Final Optimization Validation Size: {len(X_val)}")
     
@@ -237,54 +242,90 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
         optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
         loss_fn = ManualBCELoss(pos_weight=pos_weight)
         
-        # Training loop w/ early stopping
+        # Training loop w/ early stopping (both loss and F1 based)
         best_val_loss = float('inf')
-        patience_counter = 0
-        best_model_state = None
-        
+        best_val_f1 = 0.0
+        patience_counter_loss = 0
+        patience_counter_f1 = 0
         best_model_state = None
         
         start_time = time.time()
         for epoch in range(max_epochs):
-
-            model.train()
-            
-            # Manual shuffling and batching to avoid DataLoader overhead/GPU item access
-            # Generate random permutation on CPU, then use to index GPU tensors
-            perm = torch.randperm(n_samples) # CPU tensor is fine for indexing
-            
-            for i in range(0, n_samples, batch_size):
-                indices = perm[i : i + batch_size]
+            try:
+                model.train()
                 
-                # Check for last batch
-                if len(indices) == 0:
-                    continue
+                # Manual shuffling and batching to avoid DataLoader overhead/GPU item access
+                # Generate random permutation on CPU, then use to index GPU tensors
+                perm = torch.randperm(n_samples) # CPU tensor is fine for indexing
+                
+                for i in range(0, n_samples, batch_size):
+                    indices = perm[i : i + batch_size]
                     
-                # Indexing GPU tensor with CPU indices works in PyTorch and is efficient (gather)
-                X_batch = X_train_t[indices]
-                y_batch = y_train_t[indices]
+                    # Check for last batch
+                    if len(indices) == 0:
+                        continue
+                        
+                    # Indexing GPU tensor with CPU indices works in PyTorch and is efficient (gather)
+                    X_batch = X_train_t[indices]
+                    y_batch = y_train_t[indices]
+                    
+                    optimizer.zero_grad()
+                    outputs = model(X_batch)
+                    loss = loss_fn(outputs, y_batch)
+                    loss.backward()
+                    optimizer.step()
                 
-                optimizer.zero_grad()
-                outputs = model(X_batch)
-                loss = loss_fn(outputs, y_batch)
-                loss.backward()
-                optimizer.step()
-            
-            # Validation (Batched)
-            val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
-            
-            
-            # Print dot for epoch progress (visual feedback)
-            print(".", end="", flush=True)
+                # Validation (Batched)
+                val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
+                
+                # Print dot for epoch progress (visual feedback)
+                print(".", end="", flush=True)
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                best_model_state = model.state_dict()
-            else:
-                patience_counter += 1
-                if patience_counter >= early_stopping_patience:
+                # Loss-based early stopping
+                loss_improved = val_loss < best_val_loss
+                
+                if loss_improved:
+                    best_val_loss = val_loss
+                    patience_counter_loss = 0
+                    # When loss improves, also check F1 and save best model
+                    y_prob_epoch = batched_inference(model, X_val_t, batch_size)
+                    _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
+                    
+                    if val_f1 > best_val_f1:
+                        best_val_f1 = val_f1
+                        patience_counter_f1 = 0
+                        # Save best model based on F1 (primary metric for optimization)
+                        best_model_state = model.state_dict()
+                    else:
+                        patience_counter_f1 += 1
+                else:
+                    patience_counter_loss += 1
+                    # Only compute F1 when loss doesn't improve to check if we should continue
+                    if patience_counter_loss >= early_stopping_patience:
+                        # Check F1 one more time before stopping
+                        y_prob_epoch = batched_inference(model, X_val_t, batch_size)
+                        _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
+                        if val_f1 > best_val_f1:
+                            best_val_f1 = val_f1
+                            best_model_state = model.state_dict()
+                            patience_counter_loss = 0  # Reset if F1 improved
+                            patience_counter_f1 = 0
+                        else:
+                            patience_counter_f1 += 1
+                
+                # Early stopping if both loss and F1 stop improving
+                if patience_counter_loss >= early_stopping_patience and patience_counter_f1 >= early_stopping_patience:
                     break
+                    
+            except Exception as e:
+                # Handle errors gracefully during optimization
+                print(f"| Error in epoch {epoch+1}: {str(e)[:50]} |", end="", flush=True)
+                if "out of memory" in str(e).lower():
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return 1.0  # Worst possible score
+                # Continue training if it's a recoverable error
+                continue
         
         train_duration = time.time() - start_time
         print(f" {train_duration:.1f}s]", end="")
@@ -420,7 +461,7 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     return model, metrics
 
 
-def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
+def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, batch_size, 
                       max_epochs=50, early_stopping_patience=10, save_path=None):
     """
     Train the final model using the best hyperparameters found during optimization.
@@ -430,7 +471,8 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
     Args:
         best_hp (dict): Best hyperparameters.
         X_train, y_train: Training data.
-        X_test, y_test: Validation/Test data used for early stopping and evaluation.
+        X_val, y_val: Validation data used for early stopping.
+        X_test, y_test: Test data used ONLY for final evaluation.
         batch_size (int): Batch size.
         max_epochs (int): Maximum training epochs.
         early_stopping_patience (int): Patience for early stopping.
@@ -456,11 +498,17 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
     
     # Convert data to tensors and move to GPU upfront
     y_train_flat = np.array(y_train).flatten()
+    y_val_flat = np.array(y_val).flatten()
     y_test_flat = np.array(y_test).flatten()
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
+    # Use validation set for early stopping
+    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
+    y_val_t = torch.tensor(y_val_flat, dtype=torch.float32).reshape(-1, 1).to(device)
+    
+    # Test set only for final evaluation
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
     y_test_t = torch.tensor(y_test_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
@@ -511,8 +559,8 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
             
         avg_train_loss = train_loss_accum / batches if batches > 0 else 0
         
-        # Validation (Batched)
-        val_loss = batched_validation_loss(model, X_test_t, y_test_t, loss_fn, batch_size)
+        # Validation on validation set for early stopping (Batched)
+        val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
             
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -542,28 +590,42 @@ def train_final_model(best_hp, X_train, y_train, X_test, y_test, batch_size,
         except Exception as e:
             print(f"Error saving model to {save_path}: {e}")
 
-    # Final Evaluation (Batched)
+    # Final Evaluation on Test Set (Batched)
+    # Use same evaluation protocol as optimization (optimal threshold)
     y_prob = batched_inference(model, X_test_t, batch_size)
         
-    print("\nEvaluating final model...")
+    print("\nEvaluating final model on test set...")
     
-    # 1. Standard Metrics (0.5 threshold)
-    metrics = evaluations.classification_metrics(y_test, y_prob, threshold=0.5)
+    # 1. Optimal Threshold Metrics (primary - matches optimization protocol)
+    best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_test_flat, y_prob)
     
-    # 2. Optimal Threshold Metrics
-    best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_test, y_prob)
+    # 2. Standard Metrics (0.5 threshold) for reference
+    metrics_05 = evaluations.classification_metrics(y_test_flat, y_prob, threshold=0.5)
     
-    metrics.update({
+    # Combine metrics - optimal threshold is primary
+    metrics = {
         "optimal_threshold": best_thresh,
         "optimal_f1": best_f1,
         "optimal_precision": best_metrics['precision'],
-        "optimal_recall": best_metrics['recall']
-    })
+        "optimal_recall": best_metrics['recall'],
+        "optimal_roc_auc": best_metrics.get('roc_auc', None),
+        "optimal_auprc": best_metrics.get('auprc', None),
+        # Also include threshold=0.5 metrics for reference
+        "threshold_05_f1": metrics_05['f1'],
+        "threshold_05_precision": metrics_05['precision'],
+        "threshold_05_recall": metrics_05['recall'],
+        "threshold_05_roc_auc": metrics_05.get('roc_auc', None),
+        "threshold_05_auprc": metrics_05.get('auprc', None),
+    }
     
-    print(f"\nResults @ Optimal Threshold ({best_thresh:.4f}):")
+    print(f"\nResults @ Optimal Threshold ({best_thresh:.4f}) [Primary - matches optimization]:")
     print(f"  F1 Score:  {best_f1:.4f}")
     print(f"  Precision: {best_metrics['precision']:.4f}")
     print(f"  Recall:    {best_metrics['recall']:.4f}")
+    print(f"\nResults @ Threshold 0.5 [Reference]:")
+    print(f"  F1 Score:  {metrics_05['f1']:.4f}")
+    print(f"  Precision: {metrics_05['precision']:.4f}")
+    print(f"  Recall:    {metrics_05['recall']:.4f}")
     
     return model, metrics
 
@@ -853,9 +915,18 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
         
     return obj
 
-def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=100, save_path=None):
+def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, batch_size, max_epochs=100, save_path=None):
     """
-    Train final AE on full data, evaluate on Test.
+    Train final AE on full data, use validation set for early stopping, evaluate on Test.
+    
+    Args:
+        best_hp (dict): Best hyperparameters.
+        X_train, y_train: Training data.
+        X_val, y_val: Validation data used for early stopping.
+        X_test, y_test: Test data used ONLY for final evaluation.
+        batch_size (int): Batch size.
+        max_epochs (int): Maximum training epochs.
+        save_path (str, optional): Path to save the best model state dict.
     """
     print("="*60)
     print(f"FINAL AE TRAINING (Max Epochs: {max_epochs})")
@@ -885,6 +956,10 @@ def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
         drop_last=True   
     )
     
+    # Use validation set for early stopping
+    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(display_device)
+    
+    # Test set only for final evaluation
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(display_device)
     
     model = build_ae_model(best_hp, X_train.shape[1])
@@ -933,8 +1008,8 @@ def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
             
         avg_train_loss = train_loss / batches if batches > 0 else 0
         
-        # Validation (Reconstruction Loss on Test/Validation set)
-        val_loss = batched_reconstruction_loss(model, X_test_t, batch_size)
+        # Validation on validation set for early stopping (Reconstruction Loss)
+        val_loss = batched_reconstruction_loss(model, X_val_t, batch_size)
         
         print(f"Epoch {epoch+1}/{max_epochs}: Train Loss={avg_train_loss:.6f}, Val Loss={val_loss:.6f}")
         
@@ -957,25 +1032,40 @@ def train_final_ae_model(best_hp, X_train, y_train, X_test, y_test, batch_size, 
         
 
         
-    # Evaluation
-    print("\nEvaluating AE Classification Performance...")
+    # Final Evaluation on Test Set
+    # Use same evaluation protocol as optimization (optimal threshold)
+    print("\nEvaluating AE Classification Performance on test set...")
     recon_errors = get_reconstruction_errors(model, X_test_t, batch_size)
     y_test_flat = np.array(y_test).flatten()
     
-    thresh, f1, metrics = evaluations.find_optimal_threshold(y_test_flat, recon_errors)
+    # Optimal threshold metrics (primary - matches optimization protocol)
+    thresh, f1, best_metrics = evaluations.find_optimal_threshold(y_test_flat, recon_errors)
     
-    print(f"Optimal Reconstruction Threshold: {thresh:.6f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall: {metrics['recall']:.4f}")
-    
-    # Calculate AUC
+    # Calculate additional metrics
     try:
-        from sklearn.metrics import roc_auc_score
+        from sklearn.metrics import roc_auc_score, average_precision_score
         auc = roc_auc_score(y_test_flat, recon_errors)
-        print(f"ROC AUC: {auc:.4f}")
-        metrics['roc_auc'] = auc
-    except: pass
+        auprc = average_precision_score(y_test_flat, recon_errors)
+    except: 
+        auc = None
+        auprc = None
     
-    metrics['optimal_threshold'] = thresh
+    metrics = {
+        "optimal_threshold": thresh,
+        "optimal_f1": f1,
+        "optimal_precision": best_metrics['precision'],
+        "optimal_recall": best_metrics['recall'],
+        "optimal_roc_auc": auc,
+        "optimal_auprc": auprc,
+    }
+    
+    print(f"\nResults @ Optimal Threshold ({thresh:.6f}) [Primary - matches optimization]:")
+    print(f"  F1 Score:  {f1:.4f}")
+    print(f"  Precision: {best_metrics['precision']:.4f}")
+    print(f"  Recall:    {best_metrics['recall']:.4f}")
+    if auc is not None:
+        print(f"  ROC AUC:   {auc:.4f}")
+    if auprc is not None:
+        print(f"  AUPRC:     {auprc:.4f}")
+    
     return model, metrics
