@@ -1,4 +1,5 @@
-import torch, torch_directml
+import torch
+import torch_directml
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
@@ -11,32 +12,51 @@ import time
 import gc
 
 
-# Suppress DirectML CPU fallback warnings explicitly for cleaner logs
-# Using regex to ensure we match the message correctly
+# suppress directml cpu fallback warnings
 warnings.filterwarnings("ignore", message=r".*aten::lerp.*")
 warnings.filterwarnings("ignore", message=r".*aten::elu.*")
 
 def select_device():
-    return torch_directml.device()
+    """selects best available device (cuda > directml > cpu)."""
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    try:
+        import torch_directml
+        return torch_directml.device()
+    except ImportError:
+        pass
+    return torch.device('cpu')
+
+def test_direct_ml_processing():
+    """checks if directml is working correctly."""
+    try:
+        import torch_directml
+        device = torch_directml.device()
+        print(f"DirectML device: {device}")
+        
+        # simple tensor op
+        x = torch.tensor([1.0, 2.0]).to(device)
+        y = x * 2
+        print(f"Test operation successful: {y.cpu().numpy()}")
+        return True
+    except Exception as e:
+        print(f"DirectML check failed: {e}")
+        return False
 
 def test_gpu_processing():
     print(torch.__version__)
-    print("CUDA available:", torch.cuda.is_available())
+    print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
-        print("Device:", torch.cuda.get_device_name(0))
+        print(f"Device: {torch.cuda.get_device_name(0)}")
 
 def batched_inference(model: nn.Module, X_tensor: torch.Tensor, batch_size: int = 1024) -> np.ndarray:
-    """
-    Perform inference in batches to avoid OOM on large datasets.
-    Returns: numpy array of probabilities.
-    """
+    """perform inference in batches."""
     model.eval()
     probs_list = []
     n_samples = len(X_tensor)
     
     with torch.no_grad():
         for i in range(0, n_samples, batch_size):
-            batch = X_tensor[i : i + batch_size]
             batch = X_tensor[i : i + batch_size]
             outputs = model(batch)
             probs_list.append(outputs)
@@ -46,14 +66,9 @@ def batched_inference(model: nn.Module, X_tensor: torch.Tensor, batch_size: int 
         
     return torch.cat(probs_list).cpu().numpy().ravel()
 
-def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: torch.Tensor, 
-                          loss_fn: nn.Module, batch_size: int = 1024) -> float:
-    """
-    Compute validation loss in batches.
-    Returns: average loss (scalar).
-    """
+def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: torch.Tensor, loss_fn: nn.Module, batch_size: int = 1024) -> float:
+    """compute validation loss in batches."""
     model.eval()
-    # Initialize accumulator on the correct device
     total_loss = torch.tensor(0.0, device=X_tensor.device)
     n_samples = len(X_tensor)
     
@@ -63,62 +78,30 @@ def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: 
             y_batch = y_tensor[i : i + batch_size]
             
             outputs = model(X_batch)
-            # Loss function returns a tensor scalar (mean). 
-            # Accumulate on device.
+            # loss function returns mean, multiply by batch size to accumulate
             batch_loss = loss_fn(outputs, y_batch)
             total_loss += batch_loss * len(X_batch)
             
-    # Single sync at the end
     return total_loss.item() / n_samples
-
-
-def test_direct_ml_processing():
-    print("torch:", torch.__version__)
-    d = torch_directml.device()
-    print("DirectML device:", d)
-    x = torch.randn(4, device=d)
-    print("Tensor device:", x.device)
-
 
 def get_torch_activation(name: str):
     name = name.lower()
-    if name == "relu":
-        return nn.ReLU()
-    if name == "elu":
-        return nn.ELU()
-    if name == "selu":
-        return nn.SELU()
-    if name == "leaky_relu":
-        return nn.LeakyReLU(negative_slope=0.01)
-    # fallback
+    if name == "relu": return nn.ReLU()
+    if name == "elu": return nn.ELU()
+    if name == "selu": return nn.SELU()
+    if name == "leaky_relu": return nn.LeakyReLU(negative_slope=0.01)
     return nn.ReLU()
 
 
 def build_mlp_model(hyperparameters, input_shape, lr=0.001):
-    """
-    Build a PyTorch MLP (functional style) and return model, optimizer, loss_fn, device.
-
-    Args:
-      hyperparameters (dict): keys "units_per_layer", "activation", "batch_norm", "dropout_rate"
-      input_shape (int): number of input features
-      lr (float): learning rate
-
-
-    Returns:
-      model (nn.Module): the MLP model (moved to device). Outputs raw logits (no sigmoid).
-      optimizer (torch.optim.Optimizer): Adam optimizer for model.parameters()
-      loss_fn (callable): nn.BCEWithLogitsLoss()
-
-    """
-    # Device selection
+    """build pytorch mlp model."""
     device = select_device()
 
-
     units = list(hyperparameters.get("units_per_layer", []))
-    # Support per-layer activations
     activations = list(hyperparameters.get("activations", []))
+    
+    # fallback if per-layer missing
     if not activations:
-        # Fallback to global activation if per-layer list not provided
         global_act = hyperparameters.get("legacy_activation", "relu")
         activations = [global_act] * len(units)
         
@@ -129,31 +112,24 @@ def build_mlp_model(hyperparameters, input_shape, lr=0.001):
     in_dim = int(input_shape)
 
     for i, out_dim in enumerate(units):
-        # Linear
         layers.append(nn.Linear(in_dim, int(out_dim)))
-        # BatchNorm (1D for dense features)
         if use_batch_norm:
             layers.append(nn.BatchNorm1d(int(out_dim)))
-        # Activation (fresh instance)
-        # activations list was padded/prepared above
+            
         act_name = activations[i] if i < len(activations) else "relu"
         layers.append(get_torch_activation(act_name))
-        # Dropout
-        if dropout_rate and dropout_rate > 0.0:
+        
+        if dropout_rate > 0.0:
             layers.append(nn.Dropout(p=float(dropout_rate)))
         in_dim = int(out_dim)
 
-    # Final linear -> raw logits
+    # final layer (logits)
     layers.append(nn.Linear(in_dim, 1))
     layers.append(nn.Sigmoid())
 
     model = nn.Sequential(*layers)
-
-    # Move model to device (DirectML expects float32)
     model.to(device, dtype=torch.float32)
-
-    # display model summary (simple print to avoid DirectML/summary conflicts)
-    print(model)
+    # print(model) 
 
     return model
 
@@ -165,84 +141,65 @@ class ManualBCELoss(nn.Module):
         self.epsilon = epsilon
 
     def forward(self, y_pred, y_true):
-        # Clip to prevent log(0)
+        # clip to prevent log(0)
         y_pred = torch.clamp(y_pred, self.epsilon, 1.0 - self.epsilon)
         
         if self.pos_weight is not None:
-            # Weighted BCE: -[pos_weight * y * log(p) + (1-y) * log(1-p)]
+            # weighted bce
             loss = -(self.pos_weight * y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred))
         else:
-            # Standard BCE
             loss = -(y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred))
         
         return torch.mean(loss)
 
 
 def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience):
-    """
-    Build the objective: minimize (1 - F1 on validation set).
-    """
-    # Ensure inputs are numpy arrays
-    if not isinstance(X_train, np.ndarray):
-        X_train = np.array(X_train)
-    if not isinstance(y_train, np.ndarray):
-        y_train = np.array(y_train)
-    if not isinstance(X_val, np.ndarray):
-        X_val = np.array(X_val)
-    if not isinstance(y_val, np.ndarray):
-        y_val = np.array(y_val)
+    """build objective function: minimize (1 - f1)."""
+    # ensure inputs are numpy arrays
+    X_train = np.array(X_train) if not isinstance(X_train, np.ndarray) else X_train
+    y_train = np.array(y_train) if not isinstance(y_train, np.ndarray) else y_train
+    X_val = np.array(X_val) if not isinstance(X_val, np.ndarray) else X_val
+    y_val = np.array(y_val) if not isinstance(y_val, np.ndarray) else y_val
 
     device = select_device()
     print(f"Optimizer using device: {device}")
     
-    # Ensure labels are 2D (N, 1) correctly regardless of input type
-    y_train_flat = np.array(y_train).flatten()
-    y_val_flat = np.array(y_val).flatten()
+    y_train_flat = y_train.flatten()
+    y_val_flat = y_val.flatten()
 
-    # PERFORMANCE OPTIMIZATION: Downsample Validation Set for Hyperparameter Tuning
-    # Use stratified sampling to maintain class distribution
-    # Evaluating 118k samples every epoch is expensive. Limit to 30k for optimization speed.
+    # downsample validation set for speed during optimization if too large
     if len(X_val) > 10000:
-        print(f"Downsampling validation set from {len(X_val)} to 10000 for optimization speed (stratified sampling).")
+        print(f"Downsampling validation set from {len(X_val)} to 10000.")
         from sklearn.model_selection import train_test_split
-        # Use stratified sampling to maintain class distribution
+        # stratify to keep class distribution
         X_val, _, y_val_flat, _ = train_test_split(
-            X_val, y_val_flat,
-            train_size=10000,
-            stratify=y_val_flat,
-            random_state=seed
+            X_val, y_val_flat, train_size=10000, stratify=y_val_flat, random_state=seed
         )
-        
+    
     print(f"Final Optimization Validation Size: {len(X_val)}")
     
-    # PERFORMANCE FIX: Move ENTIRE dataset to GPU upfront
+    # move data to gpu upfront
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
     y_val_t = torch.tensor(y_val_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
-    print(f"DEBUG: Optimizer Data Shapes -> Train: {X_train_t.shape}, Val: {X_val_t.shape}")
-
-    
-    # Pre-calculate class weights robustly
+    # pre-calculate class weights
     num_pos = (y_train_flat == 1).sum()
     num_neg = (y_train_flat == 0).sum()
     pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
     
-    # For manual batching
     n_samples = len(X_train_t)
 
     def obj(vec):
         hp = hyp_optimizer.optimizer_vectors_to_mlp_hyperparams(vec)
         
-        # Build model
         model = build_mlp_model(hp, X_train.shape[1], lr=0.001)
         model.to(device)
         
         optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
         loss_fn = ManualBCELoss(pos_weight=pos_weight)
         
-        # Training loop w/ early stopping (both loss and F1 based)
         best_val_loss = float('inf')
         best_val_f1 = 0.0
         patience_counter_loss = 0
@@ -250,22 +207,18 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
         best_model_state = None
         
         start_time = time.time()
+        
         for epoch in range(max_epochs):
             try:
                 model.train()
                 
-                # Manual shuffling and batching to avoid DataLoader overhead/GPU item access
-                # Generate random permutation on CPU, then use to index GPU tensors
-                perm = torch.randperm(n_samples) # CPU tensor is fine for indexing
+                # manual shuffle
+                perm = torch.randperm(n_samples) 
                 
                 for i in range(0, n_samples, batch_size):
                     indices = perm[i : i + batch_size]
-                    
-                    # Check for last batch
-                    if len(indices) == 0:
-                        continue
+                    if len(indices) == 0: continue
                         
-                    # Indexing GPU tensor with CPU indices works in PyTorch and is efficient (gather)
                     X_batch = X_train_t[indices]
                     y_batch = y_train_t[indices]
                     
@@ -275,118 +228,87 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
                     loss.backward()
                     optimizer.step()
                 
-                # Validation (Batched)
+                # validation
                 val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
-                
-                # Print dot for epoch progress (visual feedback)
                 print(".", end="", flush=True)
 
-                # Loss-based early stopping
+                # early stopping logic
                 loss_improved = val_loss < best_val_loss
                 
                 if loss_improved:
                     best_val_loss = val_loss
                     patience_counter_loss = 0
-                    # When loss improves, also check F1 and save best model
+                    
+                    # check f1 if loss improved
                     y_prob_epoch = batched_inference(model, X_val_t, batch_size)
                     _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
                     
                     if val_f1 > best_val_f1:
                         best_val_f1 = val_f1
                         patience_counter_f1 = 0
-                        # Save best model based on F1 (primary metric for optimization)
                         best_model_state = model.state_dict()
                     else:
                         patience_counter_f1 += 1
                 else:
                     patience_counter_loss += 1
-                    # Only compute F1 when loss doesn't improve to check if we should continue
                     if patience_counter_loss >= early_stopping_patience:
-                        # Check F1 one more time before stopping
+                        # final check on f1 before stopping
                         y_prob_epoch = batched_inference(model, X_val_t, batch_size)
                         _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
                         if val_f1 > best_val_f1:
                             best_val_f1 = val_f1
                             best_model_state = model.state_dict()
-                            patience_counter_loss = 0  # Reset if F1 improved
+                            patience_counter_loss = 0
                             patience_counter_f1 = 0
                         else:
                             patience_counter_f1 += 1
                 
-                # Early stopping if both loss and F1 stop improving
                 if patience_counter_loss >= early_stopping_patience and patience_counter_f1 >= early_stopping_patience:
                     break
                     
             except Exception as e:
-                # Handle errors gracefully during optimization
                 print(f"| Error in epoch {epoch+1}: {str(e)[:50]} |", end="", flush=True)
                 if "out of memory" in str(e).lower():
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    return 1.0  # Worst possible score
-                # Continue training if it's a recoverable error
+                    return 1.0 # worst score
                 continue
-        
-        train_duration = time.time() - start_time
-        print(f" {train_duration:.1f}s]", end="")
 
-        # Restore best model
+        print(f" {time.time() - start_time:.1f}s]", end="")
+
         if best_model_state:
             model.load_state_dict(best_model_state)
         
-        # Evaluate F1 on validation set (Batched)
         y_prob = batched_inference(model, X_val_t, batch_size)
-            
-        # Use optimal threshold for the objective
-        # This allows the optimizer to find models that have high potential F1, 
-        # even if they are not perfectly calibrated to 0.5 yet.
         _, best_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob)
         
         return 1.0 - float(best_f1)
 
-    # Force garbage collection to help DirectML
-    import gc
     gc.collect()
-
-
-
     return obj
 
 
-def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
-                         max_epochs=40, early_stopping_patience=8):
+def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=40, early_stopping_patience=8):
     """
-    Retrain the best architecture on all training data (X_train),
-    and use X_test for validation/early stopping.
-    Finally evaluate on X_test.
+    retrain best architecture on full training data, use test set for verification.
     """
-    
-    # Handle tuple input from optimization
     if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
-        # Optimization result is typically (vector, objective, hp_dict, logs)
-        print("Extracting hyperparameters from optimization result tuple...")
         best_hp = best_hp[2]
 
     device = select_device()
     print(f"Retraining on device: {device}")
     
-    # Convert data to tensors and move to GPU upfront
-    y_train_flat = np.array(y_train).flatten()
-    y_test_flat = np.array(y_test).flatten()
+    y_train_flat = y_train.flatten()
+    y_test_flat = y_test.flatten()
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
-    
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
     y_test_t = torch.tensor(y_test_flat, dtype=torch.float32).reshape(-1, 1).to(device)
-    
-    # Train on Full X_train
-    # Use X_test as validation set for early stopping
     
     model = build_mlp_model(best_hp, X_train.shape[1], lr=0.001)
     model.to(device)
     
-    # Calculate class weights from training data
     num_pos = (y_train_flat == 1).sum()
     num_neg = (y_train_flat == 0).sum()
     pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
@@ -402,8 +324,6 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     
     for epoch in range(max_epochs):
         model.train()
-        
-        # Manual batching
         perm = torch.randperm(n_samples)
         
         for i in range(0, n_samples, batch_size):
@@ -419,7 +339,6 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
             loss.backward()
             optimizer.step()
         
-        # Validation on TEST SET (Batched)
         val_loss = batched_validation_loss(model, X_test_t, y_test_t, loss_fn, batch_size)
             
         if val_loss < best_val_loss:
@@ -434,23 +353,15 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     if best_model_state:
         model.load_state_dict(best_model_state)
         
-    # Evaluate on test set (Batched)
     y_prob = batched_inference(model, X_test_t, batch_size)
         
-    
-    # Calculate metrics with default threshold 0.5
     metrics = evaluations.classification_metrics(y_test, y_prob, threshold=0.5)
-    
-    # Find optimal threshold
     best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_test, y_prob)
     
     print(f"\nOptimal Threshold Analysis:")
     print(f"  Threshold: {best_thresh:.4f}")
     print(f"  F1 Score:  {best_f1:.4f}")
-    print(f"  Precision: {best_metrics['precision']:.4f}")
-    print(f"  Recall:    {best_metrics['recall']:.4f}")
     
-    # Add optimal metrics to the return dictionary
     metrics.update({
         "optimal_threshold": best_thresh,
         "optimal_f1": best_f1,
@@ -461,34 +372,15 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size,
     return model, metrics
 
 
-def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, batch_size, 
-                      max_epochs=50, early_stopping_patience=10, save_path=None):
+def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, batch_size, max_epochs=50, early_stopping_patience=10, save_path=None):
     """
-    Train the final model using the best hyperparameters found during optimization.
-    This function is separate from optimization helpers to allow for specific
-    final-model configurations (e.g., saving, extensive logging).
-    
-    Args:
-        best_hp (dict): Best hyperparameters.
-        X_train, y_train: Training data.
-        X_val, y_val: Validation data used for early stopping.
-        X_test, y_test: Test data used ONLY for final evaluation.
-        batch_size (int): Batch size.
-        max_epochs (int): Maximum training epochs.
-        early_stopping_patience (int): Patience for early stopping.
-        save_path (str, optional): Path to save the best model state dict.
-        
-    Returns:
-        model: Trained PyTorch model.
-        metrics: Dictionary of evaluation metrics.
+    train final model using best hyperparams.
     """
     print("="*60)
     print("FINAL MODEL TRAINING")
     print("="*60)
     
-    # Handle tuple input from optimization if passed directly
     if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
-        print("Extracting hyperparameters from optimization result tuple...")
         best_hp = best_hp[2]
         
     print(f"Hyperparameters: {best_hp}")
@@ -496,27 +388,20 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
     device = select_device()
     print(f"Training on device: {device}")
     
-    # Convert data to tensors and move to GPU upfront
-    y_train_flat = np.array(y_train).flatten()
-    y_val_flat = np.array(y_val).flatten()
-    y_test_flat = np.array(y_test).flatten()
+    y_train_flat = y_train.flatten()
+    y_val_flat = y_val.flatten()
+    y_test_flat = y_test.flatten()
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
-    
-    # Use validation set for early stopping
     X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
     y_val_t = torch.tensor(y_val_flat, dtype=torch.float32).reshape(-1, 1).to(device)
-    
-    # Test set only for final evaluation
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
     y_test_t = torch.tensor(y_test_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
-    # Build model
     model = build_mlp_model(best_hp, X_train.shape[1], lr=0.001)
     model.to(device)
     
-    # Class weights
     num_pos = (y_train_flat == 1).sum()
     num_neg = (y_train_flat == 0).sum()
     pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
@@ -529,16 +414,13 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
     patience_counter = 0
     best_model_state = None
     
-    print(f"\nStarting training for {max_epochs} epochs (patience={early_stopping_patience})...")
-    
+    print(f"\nStarting training for {max_epochs} epochs...")
     n_samples = len(X_train_t)
     
     for epoch in range(max_epochs):
         model.train()
         train_loss_accum = 0.0
         batches = 0
-        
-        # Manual batching
         perm = torch.randperm(n_samples)
         
         for i in range(0, n_samples, batch_size):
@@ -557,9 +439,7 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
             train_loss_accum += loss.item()
             batches += 1
             
-        avg_train_loss = train_loss_accum / batches if batches > 0 else 0
-        
-        # Validation on validation set for early stopping (Batched)
+        avg_train_loss = train_loss_accum / batches if batches else 0
         val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
             
         if val_loss < best_val_loss:
@@ -577,12 +457,10 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
                 print(f"Early stopping triggered at epoch {epoch+1}.")
                 break
 
-    # Load best model
     if best_model_state:
         model.load_state_dict(best_model_state)
         print("Restored best model weight state.")
         
-    # Save model if path provided
     if save_path:
         try:
             torch.save(model.state_dict(), save_path)
@@ -590,19 +468,13 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
         except Exception as e:
             print(f"Error saving model to {save_path}: {e}")
 
-    # Final Evaluation on Test Set (Batched)
-    # Use same evaluation protocol as optimization (optimal threshold)
+    # final evaluation
     y_prob = batched_inference(model, X_test_t, batch_size)
-        
     print("\nEvaluating final model on test set...")
     
-    # 1. Optimal Threshold Metrics (primary - matches optimization protocol)
     best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_test_flat, y_prob)
-    
-    # 2. Standard Metrics (0.5 threshold) for reference
     metrics_05 = evaluations.classification_metrics(y_test_flat, y_prob, threshold=0.5)
     
-    # Combine metrics - optimal threshold is primary
     metrics = {
         "optimal_threshold": best_thresh,
         "optimal_f1": best_f1,
@@ -610,7 +482,6 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
         "optimal_recall": best_metrics['recall'],
         "optimal_roc_auc": best_metrics.get('roc_auc', None),
         "optimal_auprc": best_metrics.get('auprc', None),
-        # Also include threshold=0.5 metrics for reference
         "threshold_05_f1": metrics_05['f1'],
         "threshold_05_precision": metrics_05['precision'],
         "threshold_05_recall": metrics_05['recall'],
@@ -618,14 +489,10 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
         "threshold_05_auprc": metrics_05.get('auprc', None),
     }
     
-    print(f"\nResults @ Optimal Threshold ({best_thresh:.4f}) [Primary - matches optimization]:")
+    print(f"\nResults @ Optimal Threshold ({best_thresh:.4f}):")
     print(f"  F1 Score:  {best_f1:.4f}")
     print(f"  Precision: {best_metrics['precision']:.4f}")
     print(f"  Recall:    {best_metrics['recall']:.4f}")
-    print(f"\nResults @ Threshold 0.5 [Reference]:")
-    print(f"  F1 Score:  {metrics_05['f1']:.4f}")
-    print(f"  Precision: {metrics_05['precision']:.4f}")
-    print(f"  Recall:    {metrics_05['recall']:.4f}")
     
     return model, metrics
 
@@ -635,13 +502,9 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
 # ==================================================================================
 
 def build_ae_model(hyperparameters, input_shape):
-    """
-    Builds an Autoencoder model (Encoder -> Bottleneck -> Decoder).
-    Output dimension == Input dimension (input_shape).
-    """
+    """builds autoencoder model."""
     device = select_device()
     
-    # Extract params
     n_enc = int(hyperparameters.get("n_encoder_layers", 1))
     n_dec = int(hyperparameters.get("n_decoder_layers", 1))
     latent_dim = int(hyperparameters.get("latent_size", 8))
@@ -656,7 +519,7 @@ def build_ae_model(hyperparameters, input_shape):
     
     layers = []
     
-    # --- ENCODER ---
+    # encoder
     in_dim = int(input_shape)
     for i in range(n_enc):
         out_dim = enc_units[i] if i < len(enc_units) else 64
@@ -671,11 +534,11 @@ def build_ae_model(hyperparameters, input_shape):
             
         in_dim = out_dim
         
-    # --- BOTTLENECK ---
+    # bottleneck
     layers.append(nn.Linear(in_dim, latent_dim))
     layers.append(nn.ReLU()) 
     
-    # --- DECODER ---
+    # decoder
     in_dim = latent_dim
     for i in range(n_dec):
         out_dim = dec_units[i] if i < len(dec_units) else 64
@@ -690,17 +553,16 @@ def build_ae_model(hyperparameters, input_shape):
             
         in_dim = out_dim
         
-    # --- OUTPUT LAYER ---
+    # output (linear)
     layers.append(nn.Linear(in_dim, int(input_shape)))
-    # Output activation: Identity (Linear) + MSE Loss.
     
     model = nn.Sequential(*layers)
     model.to(device, dtype=torch.float32)
-    # print(model) # Reduced verbosity for optimization
+
     return model
 
 def batched_reconstruction_loss(model, X_tensor, batch_size=1024):
-    """Calculate MSE reconstruction loss in batches."""
+    """calculate MSE reconstruction loss in batches."""
     model.eval()
     criterion = nn.MSELoss()
     total_loss = torch.tensor(0.0, device=X_tensor.device)
@@ -716,112 +578,73 @@ def batched_reconstruction_loss(model, X_tensor, batch_size=1024):
     return total_loss.item() / n
 
 def get_reconstruction_errors(model, X_tensor, batch_size=1024):
-    """Return squared error per sample: mean((X - Rec)^2, axis=1)"""
+    """return squared error per sample."""
     model.eval()
     errors_list = []
-    n = len(X_tensor)
-    
+
     with torch.no_grad():
-        for i in range(0, n, batch_size):
+        for i in range(0, len(X_tensor), batch_size):
             batch = X_tensor[i:i+batch_size]
             recon = model(batch)
-            # squared difference per feature
-            # mean over features (axis 1)
             batch_errors = torch.mean((batch - recon)**2, dim=1)
             errors_list.append(batch_errors)
             
     return torch.cat(errors_list).cpu().numpy()
 
 def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience, force_cpu=False):
-    """
-    AE Objective: 
-    1. Train on X_train (Reconstruction).
-    2. Evaluate on X_val (Reconstruction Error thresholding -> F1).
-    3. Return (1 - Optimal F1).
-    """
-    # Use GPU by default unless strictly forced or unavailable
+    """autoencoder objective: minimize (1 - f1) via reconstruction error."""
     use_gpu = (not force_cpu) and (torch.cuda.is_available() or torch_directml.device() is not None)
     
     if use_gpu:
         try:
             device = select_device()
-            # DirectML is unstable for hyperparameter optimization loops (creates/destroys many models)
             if device.type == 'privateuseone':
-                print(f"Optimizer detected DirectML ({device}).")
-                print("  ! DirectML is unstable for intensive optimization loops (causes hangs).")
-                print("  ! Falling back to CPU for STABILITY. (Expected runtime: ~20-40 mins)")
-                device = torch.device('cpu')
-            else:
-                print(f"Optimizer using DEVICE: {device}")
+                print("Warning: DirectML detected. If unstable, consider forcing CPU.")
+            print(f"Optimizer using DEVICE: {device}")
         except:
             device = torch.device('cpu')
-            print("Optimizer fell back to CPU due to device error.")
+            print("Optimizer fell back to CPU.")
     else:
         device = torch.device('cpu')
-        print("Optimizer using CPU (Forced or No GPU found).")
+        print("Optimizer using CPU.")
         
-    display_device = device
-    
-    # 1. Data Prep
-    # Validation downsampling for speed (Smart Sampling)
-    # Goal: Keep ALL Fraud cases (Class 1) to ensure F1/Recall signal is strong.
-    # Downsample only Non-Fraud (Class 0).
-    
-    # Ensure numpy
-    if isinstance(y_val, torch.Tensor):
-        y_val_np = y_val.cpu().numpy().flatten()
-    else:
-        y_val_np = np.array(y_val).flatten()
-        
-    if isinstance(X_val, torch.Tensor):
-        X_val_np = X_val.cpu().numpy()
-    else:
-        X_val_np = np.array(X_val)
+    # data prep
+    y_val_np = np.array(y_val).flatten() if not isinstance(y_val, torch.Tensor) else y_val.cpu().numpy().flatten()
+    X_val_np = np.array(X_val) if not isinstance(X_val, torch.Tensor) else X_val.cpu().numpy()
     
     total_val_limit = 20000 
     
     if len(X_val_np) > total_val_limit:
-        print(f"Smart Downsampling Validation Set (Limit: {total_val_limit})...")
-        
-        # Identify indices
+        print(f"Smart downsampling validation set to {total_val_limit}.")
         fraud_indices = np.where(y_val_np == 1)[0]
         normal_indices = np.where(y_val_np == 0)[0]
         
         n_fraud = len(fraud_indices)
         n_normal_target = total_val_limit - n_fraud
+        if n_normal_target < 1000: n_normal_target = 1000
         
-        if n_normal_target < 1000: n_normal_target = 1000 # Minimum safety
-        
-        # Sample normal
         np.random.seed(seed)
         if len(normal_indices) > n_normal_target:
             normal_indices = np.random.choice(normal_indices, size=n_normal_target, replace=False)
             
-        # Combine
         final_indices = np.concatenate([fraud_indices, normal_indices])
-        np.random.shuffle(final_indices) # Shuffle to mix
+        np.random.shuffle(final_indices)
         
         X_val_opt = X_val_np[final_indices]
         y_val_opt = y_val_np[final_indices]
-        
-        print(f"  - Original Size: {len(X_val_np)} (Fraud: {n_fraud})")
-        print(f"  - New Size: {len(X_val_opt)} (Fraud: {n_fraud} KEPT 100%)")
     else:
         X_val_opt = X_val_np
         y_val_opt = y_val_np
 
-    # Prepare Training DataLoader
+    # dataloader
     X_train_tensor = torch.from_numpy(X_train).float()
     train_dataset = TensorDataset(X_train_tensor)
     
-    # Check if validation fits in GPU memory (20k * 26 * 4 bytes < 3MB) -> Yes
-    X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(display_device)
+    X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(device)
     
-    # Input Noise for Denoising AE (fixed level for robust search)
     input_noise_std = 0.01 
     
     def obj(vec):
-        # Explicit garbage collection
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -829,56 +652,37 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
         hp = hyp_optimizer.optimizer_vectors_to_ae_hyperparams(vec)
         
         try:
-            # Build
             model = build_ae_model(hp, X_train.shape[1])
             model.to(device)
             
             optimizer = optim.Adam(model.parameters(), lr=0.001)
             criterion = nn.MSELoss()
             
-            # Create DataLoader per trial
-            # DirectML (privateuseone) is unstable with pin_memory on Windows, so disable it there.
-            use_pin_memory = (device.type != 'cpu') and (device.type != 'privateuseone')
-            
-            train_loader = DataLoader(
-                train_dataset, 
-                batch_size=batch_size, 
-                shuffle=True, 
-                pin_memory=use_pin_memory, 
-                drop_last=True 
-            )
+            use_pin = (device.type != 'cpu') and (device.type != 'privateuseone')
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_pin, drop_last=True)
             
             best_val_loss = float('inf')
             patience = 0
             best_state = None
             
-            # Train Loop
             for epoch in range(max_epochs):
-                epoch_start = time.time()
                 model.train()
-                
                 for batch_data in train_loader:
                     batch_x = batch_data[0].to(device, non_blocking=False)
                     
-                    # Denoising: Add noise to input, reconstruct original
                     if input_noise_std > 0:
-                        noise = torch.randn_like(batch_x) * input_noise_std
-                        noisy_x = batch_x + noise
+                        noisy_x = batch_x + torch.randn_like(batch_x) * input_noise_std
                     else:
                         noisy_x = batch_x
                     
                     optimizer.zero_grad()
                     recon = model(noisy_x)
-                    loss = criterion(recon, batch_x) # Reconstruct CLEAN input
+                    loss = criterion(recon, batch_x)
                     loss.backward()
                     optimizer.step()
                     
-                # Validation (MSE)
                 val_loss = batched_reconstruction_loss(model, X_val_t, batch_size)
-                
-                # Time tracking
-                epoch_duration = time.time() - epoch_start
-                print(f"[{epoch+1}:{epoch_duration:.1f}s]", end="", flush=True)
+                print(".", end="", flush=True)
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -889,12 +693,9 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
                     if patience >= early_stopping_patience:
                         break
             
-            print("]")
-            
             if best_state:
                 model.load_state_dict(best_state)
                 
-            # Evaluation
             with torch.no_grad():
                 recon_errors = get_reconstruction_errors(model, X_val_t, batch_size)
             
@@ -906,27 +707,18 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
             
         except RuntimeError as e:
             if "out of memory" in str(e):
-                print("| OOM caused by params, skipping trial |")
+                print("| OOM |", end="")
                 if hasattr(torch.cuda, 'empty_cache'): torch.cuda.empty_cache()
-                return 1.0 # Worst score
+                return 1.0
             else:
-                print(f"Error in trial: {e}")
+                print(f"Error: {e}")
                 return 1.0
         
     return obj
 
 def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, batch_size, max_epochs=100, save_path=None):
     """
-    Train final AE on full data, use validation set for early stopping, evaluate on Test.
-    
-    Args:
-        best_hp (dict): Best hyperparameters.
-        X_train, y_train: Training data.
-        X_val, y_val: Validation data used for early stopping.
-        X_test, y_test: Test data used ONLY for final evaluation.
-        batch_size (int): Batch size.
-        max_epochs (int): Maximum training epochs.
-        save_path (str, optional): Path to save the best model state dict.
+    train final ae on full data, evaluate on test.
     """
     print("="*60)
     print(f"FINAL AE TRAINING (Max Epochs: {max_epochs})")
@@ -935,36 +727,22 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
         best_hp = best_hp[2]
     
-    # Use robust device selection
     try:
-        display_device = select_device()
+        device = select_device()
     except:
-        display_device = torch.device('cpu')
+        device = torch.device('cpu')
     
-    # Prep DataLoader
     X_train_tensor = torch.from_numpy(X_train).float()
     train_dataset = TensorDataset(X_train_tensor)
     
-    display_device_type = display_device.type
-    use_pin_memory = (display_device_type != 'cpu') and (display_device_type != 'privateuseone')
-
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        pin_memory=use_pin_memory, # Enable pinned memory only for CUDA/CPU, avoid DirectML
-        drop_last=True   
-    )
+    use_pin = (device.type != 'cpu') and (device.type != 'privateuseone')
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_pin, drop_last=True)
     
-    # Use validation set for early stopping
-    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(display_device)
-    
-    # Test set only for final evaluation
-    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(display_device)
+    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
     
     model = build_ae_model(best_hp, X_train.shape[1])
-    model.to(display_device)
-    device = display_device
+    model.to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
@@ -974,13 +752,8 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     patience = 0
     patience_limit = 10
     
-    train_losses = []
-    val_losses = []
-    
-    # Input Noise for Denoising AE (Must match optimization)
     input_noise_std = 0.01
-    
-    print(f"Training AE for max {max_epochs} epochs on {device} (DAE Noise: {input_noise_std})...")
+    print(f"Training AE on {device} (Noise: {input_noise_std})...")
     
     for epoch in range(max_epochs):
         model.train()
@@ -990,28 +763,25 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
         for batch_data in train_loader:
             batch_x = batch_data[0].to(device, non_blocking=True)
             
-            # Denoising: Add noise to input
             if input_noise_std > 0:
-                noise = torch.randn_like(batch_x) * input_noise_std
-                noisy_x = batch_x + noise
+                noisy_x = batch_x + torch.randn_like(batch_x) * input_noise_std
             else:
                 noisy_x = batch_x
             
             optimizer.zero_grad()
             recon = model(noisy_x)
-            loss = criterion(recon, batch_x) # Reconstruct CLEAN input
+            loss = criterion(recon, batch_x)
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
             batches += 1
             
-        avg_train_loss = train_loss / batches if batches > 0 else 0
-        
-        # Validation on validation set for early stopping (Reconstruction Loss)
+        avg_train_loss = train_loss / batches if batches else 0
         val_loss = batched_reconstruction_loss(model, X_val_t, batch_size)
         
-        print(f"Epoch {epoch+1}/{max_epochs}: Train Loss={avg_train_loss:.6f}, Val Loss={val_loss:.6f}")
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch+1}/{max_epochs}: Train Loss={avg_train_loss:.6f}, Val Loss={val_loss:.6f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -1030,18 +800,12 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
         torch.save(model.state_dict(), save_path)
         print(f"Saved model to {save_path}")
         
-
-        
-    # Final Evaluation on Test Set
-    # Use same evaluation protocol as optimization (optimal threshold)
     print("\nEvaluating AE Classification Performance on test set...")
     recon_errors = get_reconstruction_errors(model, X_test_t, batch_size)
     y_test_flat = np.array(y_test).flatten()
     
-    # Optimal threshold metrics (primary - matches optimization protocol)
     thresh, f1, best_metrics = evaluations.find_optimal_threshold(y_test_flat, recon_errors)
     
-    # Calculate additional metrics
     try:
         from sklearn.metrics import roc_auc_score, average_precision_score
         auc = roc_auc_score(y_test_flat, recon_errors)
@@ -1059,13 +823,9 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
         "optimal_auprc": auprc,
     }
     
-    print(f"\nResults @ Optimal Threshold ({thresh:.6f}) [Primary - matches optimization]:")
+    print(f"\nResults @ Optimal Threshold ({thresh:.6f}):")
     print(f"  F1 Score:  {f1:.4f}")
     print(f"  Precision: {best_metrics['precision']:.4f}")
     print(f"  Recall:    {best_metrics['recall']:.4f}")
-    if auc is not None:
-        print(f"  ROC AUC:   {auc:.4f}")
-    if auprc is not None:
-        print(f"  AUPRC:     {auprc:.4f}")
     
     return model, metrics
