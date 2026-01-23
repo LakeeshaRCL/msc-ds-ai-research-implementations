@@ -3,9 +3,10 @@ from mealpy.swarm_based import PSO, GWO, FA
 from mealpy.utils.space import IntegerVar, FloatVar, BoolVar, CategoricalVar
 
 # supported activation functions (matching torch_gpu_processing)
-activation_functions = ["relu", "leaky_relu"]
+# supported activation functions (matching torch_gpu_processing)
+activation_functions = ["relu", "leaky_relu", "elu", "selu", "gelu", "silu"]
 batch_sizes = [256, 512, 1024, 2048]
-hidden_layer_unit_choices = list(range(16, 257, 8))
+hidden_layer_unit_choices = list(range(16, 513, 16)) # Up to 512, step 16
 
 def decode_scalar(raw_value, spec):
     val = np.clip(raw_value, spec["low"], spec["high"])
@@ -145,7 +146,7 @@ def get_ae_hyperparameter_bounds_config(min_layers=1, max_layers=4):
     bounds_config = [
         {"type": "int", "name": "n_encoder_layers", "lb": min_layers, "ub": max_layers},
         {"type": "int", "name": "n_decoder_layers", "lb": min_layers, "ub": max_layers},
-        {"type": "categorical", "name": "latent_size", "choices": [4, 8, 12, 16, 20, 24, 32, 64]}, 
+        {"type": "categorical", "name": "latent_size", "choices": [4, 8, 12, 16, 24, 32, 48, 64, 96, 128]}, 
         {"type": "float", "name": "dropout_rate", "lb": 0.0, "ub": 0.5},
         {"type": "bool", "name": "batch_norm"},
     ]
@@ -164,7 +165,7 @@ def optimizer_vectors_to_ae_hyperparams(vector):
     n_encoder = int(round(decode_scalar(vector[0], {"low": 1, "high": 4})))
     n_decoder = int(round(decode_scalar(vector[1], {"low": 1, "high": 4})))
     
-    latent_choices = [4, 8, 12, 16, 20, 24, 32, 64]
+    latent_choices = [4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
     latent_val = vector[2]
     
     if latent_val in latent_choices:
@@ -181,7 +182,7 @@ def optimizer_vectors_to_ae_hyperparams(vector):
     
     current_idx = 5
     enc_units, enc_acts, dec_units, dec_acts = [], [], [], []
-    max_layers_assumed = 4 
+    max_layers_assumed = 8
     
     def get_cat(val, choices):
         if val in choices: return val

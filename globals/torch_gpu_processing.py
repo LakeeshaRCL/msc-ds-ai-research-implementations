@@ -90,6 +90,8 @@ def get_torch_activation(name: str):
     if name == "elu": return nn.ELU()
     if name == "selu": return nn.SELU()
     if name == "leaky_relu": return nn.LeakyReLU(negative_slope=0.01)
+    if name == "gelu": return nn.GELU()
+    if name == "silu" or name == "swish": return nn.SiLU()
     return nn.ReLU()
 
 
@@ -536,7 +538,7 @@ def build_ae_model(hyperparameters, input_shape):
         
     # bottleneck
     layers.append(nn.Linear(in_dim, latent_dim))
-    layers.append(nn.ReLU()) 
+    # Removed ReLU to allow full usage of latent space (negatives included)
     
     # decoder
     in_dim = latent_dim
@@ -612,26 +614,25 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
     y_val_np = np.array(y_val).flatten() if not isinstance(y_val, torch.Tensor) else y_val.cpu().numpy().flatten()
     X_val_np = np.array(X_val) if not isinstance(X_val, torch.Tensor) else X_val.cpu().numpy()
     
-    total_val_limit = 20000 
+    total_val_limit = 5000 
     
     if len(X_val_np) > total_val_limit:
-        print(f"Smart downsampling validation set to {total_val_limit}.")
-        fraud_indices = np.where(y_val_np == 1)[0]
-        normal_indices = np.where(y_val_np == 0)[0]
-        
-        n_fraud = len(fraud_indices)
-        n_normal_target = total_val_limit - n_fraud
-        if n_normal_target < 1000: n_normal_target = 1000
-        
-        np.random.seed(seed)
-        if len(normal_indices) > n_normal_target:
-            normal_indices = np.random.choice(normal_indices, size=n_normal_target, replace=False)
-            
-        final_indices = np.concatenate([fraud_indices, normal_indices])
-        np.random.shuffle(final_indices)
-        
-        X_val_opt = X_val_np[final_indices]
-        y_val_opt = y_val_np[final_indices]
+        print(f"Stratified downsampling validation set to {total_val_limit} to preserve class distribution.")
+        from sklearn.model_selection import train_test_split
+        # Stratified sampling to maintain the real (low) anomaly rate
+        try:
+            X_val_opt, _, y_val_opt, _ = train_test_split(
+                X_val_np, y_val_np, 
+                train_size=total_val_limit, 
+                stratify=y_val_np, 
+                random_state=seed
+            )
+        except ValueError as e:
+            print(f"Warning: Stratified sampling failed (likely too few positive samples). Falling back to random sampling. Error: {e}")
+            # Fallback for extremely rare classes
+            indices = np.random.choice(len(X_val_np), total_val_limit, replace=False)
+            X_val_opt = X_val_np[indices]
+            y_val_opt = y_val_np[indices]
     else:
         X_val_opt = X_val_np
         y_val_opt = y_val_np
@@ -642,7 +643,7 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
     
     X_val_t = torch.tensor(X_val_opt, dtype=torch.float32).to(device)
     
-    input_noise_std = 0.01 
+    input_noise_std = 0.1  # Increased from 0.01 for better denoising
     
     def obj(vec):
         gc.collect()
@@ -655,7 +656,7 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
             model = build_ae_model(hp, X_train.shape[1])
             model.to(device)
             
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
             criterion = nn.MSELoss()
             
             use_pin = (device.type != 'cpu') and (device.type != 'privateuseone')
@@ -699,11 +700,26 @@ def set_ae_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch
             with torch.no_grad():
                 recon_errors = get_reconstruction_errors(model, X_val_t, batch_size)
             
-            _, best_f1, _ = evaluations.find_optimal_threshold(y_val_opt, recon_errors)
+            # Calculate Metrics
+            # 1. AUPRC (Robust objective)
+            auprc = evaluations.average_precision_score(y_val_opt, recon_errors)
+            
+            # 2. ROC AUC
+            try:
+                roc_auc = evaluations.roc_auc_score(y_val_opt, recon_errors)
+            except:
+                roc_auc = 0.5
+
+            # 3. F1/Precision/Recall at optimal threshold (for reporting)
+            best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_val_opt, recon_errors)
+            
+            print(f" [AUPRC: {auprc:.4f} | F1: {best_f1:.4f} | ROC: {roc_auc:.4f}]", end="")
             
             del model
             del optimizer
-            return 1.0 - best_f1
+            
+            # Objective: Maximize AUPRC => Minimize (1 - AUPRC)
+            return 1.0 - auprc
             
         except RuntimeError as e:
             if "out of memory" in str(e):
@@ -744,7 +760,7 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     model = build_ae_model(best_hp, X_train.shape[1])
     model.to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     criterion = nn.MSELoss()
     
     best_val_loss = float('inf')
@@ -752,7 +768,7 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     patience = 0
     patience_limit = 10
     
-    input_noise_std = 0.01
+    input_noise_std = 0.1 # Increased from 0.01
     print(f"Training AE on {device} (Noise: {input_noise_std})...")
     
     for epoch in range(max_epochs):
