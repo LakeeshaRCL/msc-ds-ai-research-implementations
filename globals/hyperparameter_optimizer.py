@@ -6,9 +6,9 @@ from mealpy.utils.space import IntegerVar, FloatVar, BoolVar, CategoricalVar
 # supported activation functions (matching torch_gpu_processing)
 activation_functions = ["relu", "leaky_relu", "elu", "selu", "gelu", "silu"]
 batch_sizes = [256, 512, 1024, 2048]
-hidden_layer_unit_choices = list(range(16, 513, 16)) # Up to 512, step 16
+hidden_layer_unit_choices = list(range(16, 1025, 16)) # Up to 1024, step 16
 
-def decode_scalar(raw_value, spec):
+def shared_decode_scalar(raw_value, spec):
     val = np.clip(raw_value, spec["low"], spec["high"])
     if spec.get("round"):
         val = int(round(val))
@@ -18,7 +18,7 @@ def decode_scalar(raw_value, spec):
         val = int(np.clip(val, spec["low"], spec["high"]))
     return val
 
-def get_hyperparameter_bounds_config(min_layers=1, max_layers=4):
+def mlp_get_hyperparameter_bounds_config(min_layers=1, max_layers=4):
     """returns bound config list."""
     bounds_config = [
         {"type": "int", "name": "n_layers", "lb": min_layers, "ub": max_layers},
@@ -40,7 +40,7 @@ def get_hyperparameter_bounds_config(min_layers=1, max_layers=4):
         
     return bounds_config
 
-def optimizer_vectors_to_mlp_hyperparams(vector):
+def mlp_optimizer_vectors_to_hyperparams(vector):
     """decode optimizer vector to mlp params."""
     n_layers = int(np.round(vector[0])) if isinstance(vector[0], (float, np.floating)) else int(vector[0])
     dropout = float(np.clip(vector[1], 0.0, 0.5))
@@ -79,9 +79,9 @@ def optimizer_vectors_to_mlp_hyperparams(vector):
         "legacy_dropout_rate": dropout,
     }
 
-def run_hyperparam_optimization(algorithm, objective, iterations, population, min_layers=1, max_layers=4):
+def mlp_run_hyperparam_optimization(algorithm, objective, iterations, population, min_layers=1, max_layers=4):
     """run mealpy optimizer."""
-    bounds_cfg = get_hyperparameter_bounds_config(min_layers, max_layers)
+    bounds_cfg = mlp_get_hyperparameter_bounds_config(min_layers, max_layers)
     optimizer_bounds = []
     for cfg in bounds_cfg:
         if cfg['type'] == 'int':
@@ -107,7 +107,7 @@ def run_hyperparam_optimization(algorithm, objective, iterations, population, mi
     best_agent = optimizer.solve(problem)
     best_vec = best_agent.solution
     best_obj = best_agent.target.fitness
-    best_hp = optimizer_vectors_to_mlp_hyperparams(best_vec)
+    best_hp = mlp_optimizer_vectors_to_hyperparams(best_vec)
 
     epoch_logs = []
     history_vectors = getattr(optimizer.history, "list_global_best", [])
@@ -118,7 +118,7 @@ def run_hyperparam_optimization(algorithm, objective, iterations, population, mi
     for i in range(len(history_scores)):
         vec_epoch = history_vectors[i]
         f1_epoch = 1.0 - history_scores[i]
-        hp_epoch = optimizer_vectors_to_mlp_hyperparams(vec_epoch)
+        hp_epoch = mlp_optimizer_vectors_to_hyperparams(vec_epoch)
         
         epoch_logs.append({
             "epoch": i + 1,
@@ -162,8 +162,8 @@ def get_ae_hyperparameter_bounds_config(min_layers=1, max_layers=4):
 
 def optimizer_vectors_to_ae_hyperparams(vector):
     """decode ae optimizer vector."""
-    n_encoder = int(round(decode_scalar(vector[0], {"low": 1, "high": 4})))
-    n_decoder = int(round(decode_scalar(vector[1], {"low": 1, "high": 4})))
+    n_encoder = int(round(shared_decode_scalar(vector[0], {"low": 1, "high": 4})))
+    n_decoder = int(round(shared_decode_scalar(vector[1], {"low": 1, "high": 4})))
     
     latent_choices = [4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
     latent_val = vector[2]

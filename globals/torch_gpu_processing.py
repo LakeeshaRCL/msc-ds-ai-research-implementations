@@ -16,7 +16,7 @@ import gc
 warnings.filterwarnings("ignore", message=r".*aten::lerp.*")
 warnings.filterwarnings("ignore", message=r".*aten::elu.*")
 
-def select_device():
+def shared_select_device():
     """selects best available device (cuda > directml > cpu)."""
     if torch.cuda.is_available():
         return torch.device('cuda')
@@ -27,7 +27,7 @@ def select_device():
         pass
     return torch.device('cpu')
 
-def test_direct_ml_processing():
+def shared_test_direct_ml_processing():
     """checks if directml is working correctly."""
     try:
         import torch_directml
@@ -43,13 +43,13 @@ def test_direct_ml_processing():
         print(f"DirectML check failed: {e}")
         return False
 
-def test_gpu_processing():
+def shared_test_gpu_processing():
     print(torch.__version__)
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"Device: {torch.cuda.get_device_name(0)}")
 
-def batched_inference(model: nn.Module, X_tensor: torch.Tensor, batch_size: int = 1024) -> np.ndarray:
+def mlp_batched_inference(model: nn.Module, X_tensor: torch.Tensor, batch_size: int = 1024) -> np.ndarray:
     """perform inference in batches."""
     model.eval()
     probs_list = []
@@ -66,7 +66,7 @@ def batched_inference(model: nn.Module, X_tensor: torch.Tensor, batch_size: int 
         
     return torch.cat(probs_list).cpu().numpy().ravel()
 
-def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: torch.Tensor, loss_fn: nn.Module, batch_size: int = 1024) -> float:
+def mlp_batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: torch.Tensor, loss_fn: nn.Module, batch_size: int = 1024) -> float:
     """compute validation loss in batches."""
     model.eval()
     total_loss = torch.tensor(0.0, device=X_tensor.device)
@@ -84,7 +84,7 @@ def batched_validation_loss(model: nn.Module, X_tensor: torch.Tensor, y_tensor: 
             
     return total_loss.item() / n_samples
 
-def get_torch_activation(name: str):
+def shared_get_torch_activation(name: str):
     name = name.lower()
     if name == "relu": return nn.ReLU()
     if name == "elu": return nn.ELU()
@@ -95,9 +95,9 @@ def get_torch_activation(name: str):
     return nn.ReLU()
 
 
-def build_mlp_model(hyperparameters, input_shape, lr=0.001):
+def mlp_build_model(hyperparameters, input_shape, lr=0.001):
     """build pytorch mlp model."""
-    device = select_device()
+    device = shared_select_device()
 
     units = list(hyperparameters.get("units_per_layer", []))
     activations = list(hyperparameters.get("activations", []))
@@ -119,7 +119,7 @@ def build_mlp_model(hyperparameters, input_shape, lr=0.001):
             layers.append(nn.BatchNorm1d(int(out_dim)))
             
         act_name = activations[i] if i < len(activations) else "relu"
-        layers.append(get_torch_activation(act_name))
+        layers.append(shared_get_torch_activation(act_name))
         
         if dropout_rate > 0.0:
             layers.append(nn.Dropout(p=float(dropout_rate)))
@@ -136,7 +136,7 @@ def build_mlp_model(hyperparameters, input_shape, lr=0.001):
     return model
 
 
-class ManualBCELoss(nn.Module):
+class mlp_ManualBCELoss(nn.Module):
     def __init__(self, pos_weight=None, epsilon=1e-7):
         super().__init__()
         self.pos_weight = pos_weight
@@ -155,7 +155,7 @@ class ManualBCELoss(nn.Module):
         return torch.mean(loss)
 
 
-def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience):
+def mlp_set_optimizer_objective_old(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience):
     """build objective function: minimize (1 - f1)."""
     # ensure inputs are numpy arrays
     X_train = np.array(X_train) if not isinstance(X_train, np.ndarray) else X_train
@@ -163,7 +163,7 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
     X_val = np.array(X_val) if not isinstance(X_val, np.ndarray) else X_val
     y_val = np.array(y_val) if not isinstance(y_val, np.ndarray) else y_val
 
-    device = select_device()
+    device = shared_select_device()
     print(f"Optimizer using device: {device}")
     
     y_train_flat = y_train.flatten()
@@ -194,13 +194,13 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
     n_samples = len(X_train_t)
 
     def obj(vec):
-        hp = hyp_optimizer.optimizer_vectors_to_mlp_hyperparams(vec)
+        hp = hyp_optimizer.mlp_optimizer_vectors_to_hyperparams(vec)
         
-        model = build_mlp_model(hp, X_train.shape[1], lr=0.001)
+        model = mlp_build_model(hp, X_train.shape[1], lr=0.001)
         model.to(device)
         
         optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
-        loss_fn = ManualBCELoss(pos_weight=pos_weight)
+        loss_fn = mlp_ManualBCELoss(pos_weight=pos_weight)
         
         best_val_loss = float('inf')
         best_val_f1 = 0.0
@@ -231,7 +231,7 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
                     optimizer.step()
                 
                 # validation
-                val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
+                val_loss = mlp_batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
                 print(".", end="", flush=True)
 
                 # early stopping logic
@@ -242,7 +242,7 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
                     patience_counter_loss = 0
                     
                     # check f1 if loss improved
-                    y_prob_epoch = batched_inference(model, X_val_t, batch_size)
+                    y_prob_epoch = mlp_batched_inference(model, X_val_t, batch_size)
                     _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
                     
                     if val_f1 > best_val_f1:
@@ -255,7 +255,7 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
                     patience_counter_loss += 1
                     if patience_counter_loss >= early_stopping_patience:
                         # final check on f1 before stopping
-                        y_prob_epoch = batched_inference(model, X_val_t, batch_size)
+                        y_prob_epoch = mlp_batched_inference(model, X_val_t, batch_size)
                         _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
                         if val_f1 > best_val_f1:
                             best_val_f1 = val_f1
@@ -276,12 +276,31 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
                     return 1.0 # worst score
                 continue
 
-        print(f" {time.time() - start_time:.1f}s]", end="")
+        # Full Evaluation (Training vs Validation) to check Overfitting
+        model.eval()
+        with torch.no_grad():
+            # Training Metrics
+            y_prob_train = mlp_batched_inference(model, X_train_t, batch_size)
+            _, train_f1, train_metrics = evaluations.find_optimal_threshold(y_train_t.cpu().numpy(), y_prob_train)
+            train_acc = evaluations.accuracy_score(y_train_t.cpu().numpy(), (y_prob_train > 0.5).astype(int))
+
+            # Validation Metrics
+            y_prob_val = mlp_batched_inference(model, X_val_t, batch_size)
+            val_thresh, val_f1, val_metrics = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_val)
+            val_acc = evaluations.accuracy_score(y_val_t.cpu().numpy(), (y_prob_val > 0.5).astype(int))
+            
+            try:
+                val_auprc = evaluations.average_precision_score(y_val_t.cpu().numpy(), y_prob_val)
+            except:
+                val_auprc = 0.0
+
+        print(f" {time.time() - start_time:.1f}s | Train F1: {train_f1:.4f} Acc: {train_acc:.4f} | Val F1: {val_f1:.4f} Acc: {val_acc:.4f} AUPRC: {val_auprc:.4f}]", end="")
 
         if best_model_state:
             model.load_state_dict(best_model_state)
         
-        y_prob = batched_inference(model, X_val_t, batch_size)
+        # Recalculate best val F1 from best state (just in case last epoch wasn't best)
+        y_prob = mlp_batched_inference(model, X_val_t, batch_size)
         _, best_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob)
         
         return 1.0 - float(best_f1)
@@ -290,14 +309,295 @@ def set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_si
     return obj
 
 
-def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=40, early_stopping_patience=8):
+def mlp_set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batch_size, seed, early_stopping_patience):
+    """
+    Build objective function: minimize (1 - f1).
+
+    Parameters:
+    -----------
+    X_train : array
+        SMOTE-balanced training data (should be ~50/50)
+    y_train : array
+        SMOTE-balanced training labels (should be ~50/50)
+    X_val : array
+        Original IMBALANCED validation data
+    y_val : array
+        Original IMBALANCED validation labels
+    max_epochs : int
+        Maximum training epochs per hyperparameter evaluation
+    batch_size : int
+        Batch size for training
+    seed : int
+        Random seed
+    early_stopping_patience : int
+        Patience for early stopping
+
+    Returns:
+    --------
+    obj : function
+        Objective function for optimizer
+    """
+    # ensure inputs are numpy arrays
+    X_train = np.array(X_train) if not isinstance(X_train, np.ndarray) else X_train
+    y_train = np.array(y_train) if not isinstance(y_train, np.ndarray) else y_train
+    X_val = np.array(X_val) if not isinstance(X_val, np.ndarray) else X_val
+    y_val = np.array(y_val) if not isinstance(y_val, np.ndarray) else y_val
+
+    device = shared_select_device()
+    print(f"Optimizer using device: {device}")
+
+    y_train_flat = y_train.flatten()
+    y_val_flat = y_val.flatten()
+
+    # verifying dataset distribution
+    train_fraud_rate = y_train_flat.mean()
+    val_fraud_rate_original = y_val_flat.mean()
+
+    print(f"\nData Distribution Check:")
+    print(f"  Training fraud rate: {train_fraud_rate:.4f} (should be ~0.50 after SMOTE)")
+    print(f"  Validation fraud rate: {val_fraud_rate_original:.4f} (should be original imbalanced)")
+
+    if train_fraud_rate < 0.4 or train_fraud_rate > 0.6:
+        print("  ⚠️  WARNING: Training data doesn't appear balanced! Did you apply SMOTE?")
+
+    if val_fraud_rate_original > 0.4:
+        print("  ⚠️  WARNING: Validation data appears balanced! It should be ORIGINAL imbalanced distribution!")
+
+    # only downsamples the normal cases
+    if len(X_val) > 10000:
+        print(f"\nValidation downsampling (preserving ALL fraud)...")
+        print(f"  Original validation size: {len(X_val)}")
+
+        # Separate fraud and non-fraud
+        fraud_mask = (y_val_flat == 1)
+        X_fraud = X_val[fraud_mask]
+        y_fraud = y_val_flat[fraud_mask]
+        X_normal = X_val[~fraud_mask]
+        y_normal = y_val_flat[~fraud_mask]
+
+        # Store original counts for reporting
+        original_fraud_count = len(X_fraud)
+        original_normal_count = len(X_normal)
+
+        print(f"  Fraud samples: {original_fraud_count}")
+        print(f"  Normal samples: {original_normal_count}")
+
+        # Keep ALL fraud cases (never lose minority class!)
+        # Downsample normal cases to fit within limit
+        n_normal_to_keep = min(10000 - len(X_fraud), len(X_normal))
+
+        if n_normal_to_keep < len(X_normal):
+            np.random.seed(seed)
+            normal_indices = np.random.choice(len(X_normal), n_normal_to_keep, replace=False)
+            X_normal = X_normal[normal_indices]
+            y_normal = y_normal[normal_indices]
+
+        # Combine fraud (all) + normal (sampled)
+        X_val = np.vstack([X_fraud, X_normal])
+        y_val_flat = np.concatenate([y_fraud, y_normal])
+
+        print(f"  Downsampled validation size: {len(X_val)}")
+        print(f"  - Fraud samples: {len(X_fraud)} (100% retention)")
+        print(f"  - Normal samples: {len(X_normal)} ({100 * len(X_normal) / original_normal_count:.1f}% retention)")
+
+    val_fraud_rate = y_val_flat.mean()
+    print(f"\nFinal validation fraud rate: {val_fraud_rate:.4f}")
+    print(f"Final validation size: {len(X_val)}")
+
+
+    # move data to GPU upfront for efficiency
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_t = torch.tensor(y_train_flat, dtype=torch.float32).reshape(-1, 1).to(device)
+    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
+    y_val_t = torch.tensor(y_val_flat, dtype=torch.float32).reshape(-1, 1).to(device)
+
+    # calculate class weights from balanced training data
+    num_pos = (y_train_flat == 1).sum()
+    num_neg = (y_train_flat == 0).sum()
+    pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
+
+    print(f"\nClass weight calculation:")
+    print(f"  Positive samples: {num_pos}")
+    print(f"  Negative samples: {num_neg}")
+    print(f"  Positive class weight: {pos_weight:.4f} (should be ~1.0 after SMOTE)")
+
+    n_samples = len(X_train_t)
+
+    # define objective function
+    def obj(vec):
+        """
+        Objective function for a single hyperparameter configuration.
+        Returns: 1.0 - F1 (to minimize)
+        """
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # convert vector to hyperparameters
+        hp = hyp_optimizer.mlp_optimizer_vectors_to_hyperparams(vec)
+
+        try:
+            # build model
+            model = mlp_build_model(hp, X_train.shape[1], lr=0.001)
+            model.to(device)
+
+            # setup optimizer and loss
+            optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
+            loss_fn = mlp_ManualBCELoss(pos_weight=pos_weight)
+
+            # early stopping variables
+            best_val_loss = float('inf')
+            best_val_f1 = 0.0
+            patience_counter_loss = 0
+            patience_counter_f1 = 0
+            best_model_state = None
+
+            start_time = time.time()
+
+            # training Loop
+            for epoch in range(max_epochs):
+                try:
+                    model.train()
+
+                    # manual shuffle for each epoch
+                    perm = torch.randperm(n_samples)
+
+                    # mini-batch training
+                    for i in range(0, n_samples, batch_size):
+                        indices = perm[i: i + batch_size]
+                        if len(indices) == 0:
+                            continue
+
+                        X_batch = X_train_t[indices]
+                        y_batch = y_train_t[indices]
+
+                        # Forward pass
+                        optimizer.zero_grad()
+                        outputs = model(X_batch)
+                        loss = loss_fn(outputs, y_batch)
+
+                        # Backward pass
+                        loss.backward()
+                        optimizer.step()
+
+                    # validation (on original imbalanced data)
+                    val_loss = mlp_batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
+                    print(".", end="", flush=True)
+
+                    # early stopping based on both loss and F1
+                    loss_improved = val_loss < best_val_loss
+
+                    if loss_improved:
+                        best_val_loss = val_loss
+                        patience_counter_loss = 0
+
+                        # check F1 if loss improved
+                        y_prob_epoch = mlp_batched_inference(model, X_val_t, batch_size)
+                        _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
+
+                        if val_f1 > best_val_f1:
+                            best_val_f1 = val_f1
+                            patience_counter_f1 = 0
+                            best_model_state = model.state_dict()
+                        else:
+                            patience_counter_f1 += 1
+                    else:
+                        patience_counter_loss += 1
+
+                        # if loss hasn't improved for patience epochs, check F1 before stopping
+                        if patience_counter_loss >= early_stopping_patience:
+                            y_prob_epoch = mlp_batched_inference(model, X_val_t, batch_size)
+                            _, val_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_epoch)
+
+                            if val_f1 > best_val_f1:
+                                best_val_f1 = val_f1
+                                best_model_state = model.state_dict()
+                                patience_counter_loss = 0
+                                patience_counter_f1 = 0
+                            else:
+                                patience_counter_f1 += 1
+
+                    # stop if both loss and F1 haven't improved
+                    if patience_counter_loss >= early_stopping_patience and patience_counter_f1 >= early_stopping_patience:
+                        break
+
+                except Exception as e:
+                    print(f"| Error in epoch {epoch + 1}: {str(e)[:50]} |", end="", flush=True)
+                    if "out of memory" in str(e).lower():
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        return 1.0  # Return worst score
+                    continue
+
+            # final evaluation to verify overfitting issues
+            model.eval()
+            with torch.no_grad():
+                # training metrics - using balanced data
+                y_prob_train = mlp_batched_inference(model, X_train_t, batch_size)
+                _, train_f1, train_metrics = evaluations.find_optimal_threshold(y_train_t.cpu().numpy(), y_prob_train)
+                train_acc = evaluations.accuracy_score(y_train_t.cpu().numpy(), (y_prob_train > 0.5).astype(int))
+
+                # validation metrics (on real imbalanced data)
+                y_prob_val = mlp_batched_inference(model, X_val_t, batch_size)
+                val_thresh, val_f1, val_metrics = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob_val)
+                val_acc = evaluations.accuracy_score(y_val_t.cpu().numpy(), (y_prob_val > 0.5).astype(int))
+
+                try:
+                    val_auprc = evaluations.average_precision_score(y_val_t.cpu().numpy(), y_prob_val)
+                except:
+                    val_auprc = 0.0
+
+
+            elapsed = time.time() - start_time
+            print(
+                f" {elapsed:.1f}s | Train F1: {train_f1:.4f} Acc: {train_acc:.4f} | Val F1: {val_f1:.4f} Acc: {val_acc:.4f} AUPRC: {val_auprc:.4f}]",
+                end="")
+
+            # load best model state
+            if best_model_state:
+                model.load_state_dict(best_model_state)
+
+            # re-calculate the best validation F1 from best model state
+            with torch.no_grad():
+                y_prob = mlp_batched_inference(model, X_val_t, batch_size)
+                _, best_f1, _ = evaluations.find_optimal_threshold(y_val_t.cpu().numpy(), y_prob)
+
+            # clean up
+            del model
+            del optimizer
+
+            # return objective: minimize (1 - F1)
+            return 1.0 - float(best_f1)
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print("| OOM |", end="", flush=True)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return 1.0  # return worst score
+            else:
+                print(f"| Runtime Error: {str(e)[:30]} |", end="", flush=True)
+                return 1.0
+        except Exception as e:
+            print(f"| Unexpected Error: {str(e)[:30]} |", end="", flush=True)
+            return 1.0
+
+    # clean up before returning
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return obj
+
+
+def mlp_retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, max_epochs=40, early_stopping_patience=8):
     """
     retrain best architecture on full training data, use test set for verification.
     """
     if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
         best_hp = best_hp[2]
 
-    device = select_device()
+    device = shared_select_device()
     print(f"Retraining on device: {device}")
     
     y_train_flat = y_train.flatten()
@@ -308,7 +608,7 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, 
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
     y_test_t = torch.tensor(y_test_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
-    model = build_mlp_model(best_hp, X_train.shape[1], lr=0.001)
+    model = mlp_build_model(best_hp, X_train.shape[1], lr=0.001)
     model.to(device)
     
     num_pos = (y_train_flat == 1).sum()
@@ -316,7 +616,7 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, 
     pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
     
     optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
-    loss_fn = ManualBCELoss(pos_weight=pos_weight)
+    loss_fn = mlp_ManualBCELoss(pos_weight=pos_weight)
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -341,7 +641,7 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, 
             loss.backward()
             optimizer.step()
         
-        val_loss = batched_validation_loss(model, X_test_t, y_test_t, loss_fn, batch_size)
+        val_loss = mlp_batched_validation_loss(model, X_test_t, y_test_t, loss_fn, batch_size)
             
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -355,7 +655,7 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, 
     if best_model_state:
         model.load_state_dict(best_model_state)
         
-    y_prob = batched_inference(model, X_test_t, batch_size)
+    y_prob = mlp_batched_inference(model, X_test_t, batch_size)
         
     metrics = evaluations.classification_metrics(y_test, y_prob, threshold=0.5)
     best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_test, y_prob)
@@ -374,7 +674,7 @@ def retrain_and_evaluate(best_hp, X_train, y_train, X_test, y_test, batch_size, 
     return model, metrics
 
 
-def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, batch_size, max_epochs=50, early_stopping_patience=10, save_path=None):
+def mlp_train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, batch_size, max_epochs=50, early_stopping_patience=10, save_path=None):
     """
     train final model using best hyperparams.
     """
@@ -387,7 +687,7 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
         
     print(f"Hyperparameters: {best_hp}")
     
-    device = select_device()
+    device = shared_select_device()
     print(f"Training on device: {device}")
     
     y_train_flat = y_train.flatten()
@@ -401,7 +701,7 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
     y_test_t = torch.tensor(y_test_flat, dtype=torch.float32).reshape(-1, 1).to(device)
     
-    model = build_mlp_model(best_hp, X_train.shape[1], lr=0.001)
+    model = mlp_build_model(best_hp, X_train.shape[1], lr=0.001)
     model.to(device)
     
     num_pos = (y_train_flat == 1).sum()
@@ -410,7 +710,7 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
     print(f"Using positive class weight: {pos_weight:.4f}")
     
     optimizer = optim.Adam(model.parameters(), lr=0.001, foreach=False)
-    loss_fn = ManualBCELoss(pos_weight=pos_weight)
+    loss_fn = mlp_ManualBCELoss(pos_weight=pos_weight)
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -442,7 +742,7 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
             batches += 1
             
         avg_train_loss = train_loss_accum / batches if batches else 0
-        val_loss = batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
+        val_loss = mlp_batched_validation_loss(model, X_val_t, y_val_t, loss_fn, batch_size)
             
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -471,7 +771,7 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
             print(f"Error saving model to {save_path}: {e}")
 
     # final evaluation
-    y_prob = batched_inference(model, X_test_t, batch_size)
+    y_prob = mlp_batched_inference(model, X_test_t, batch_size)
     print("\nEvaluating final model on test set...")
     
     best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_test_flat, y_prob)
@@ -491,8 +791,16 @@ def train_final_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test, b
         "threshold_05_auprc": metrics_05.get('auprc', None),
     }
     
+    best_acc = evaluations.accuracy_score(y_test_flat, (y_prob >= best_thresh).astype(int))
+    try:
+        best_auprc = evaluations.average_precision_score(y_test_flat, y_prob)
+    except:
+        best_auprc = 0.0
+
     print(f"\nResults @ Optimal Threshold ({best_thresh:.4f}):")
     print(f"  F1 Score:  {best_f1:.4f}")
+    print(f"  Accuracy:  {best_acc:.4f}")
+    print(f"  AUPRC:     {best_auprc:.4f}")
     print(f"  Precision: {best_metrics['precision']:.4f}")
     print(f"  Recall:    {best_metrics['recall']:.4f}")
     
@@ -1004,3 +1312,9 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     print("=" * 60)
 
     return model, metrics
+
+# Backward compatibility aliases for AE notebook
+select_device = shared_select_device
+test_direct_ml_processing = shared_test_direct_ml_processing
+test_gpu_processing = shared_test_gpu_processing
+get_torch_activation = shared_get_torch_activation
