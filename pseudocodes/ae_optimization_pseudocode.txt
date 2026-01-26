@@ -1,0 +1,45 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Input: X_train, y_train, X_val, y_val, Algorithm ∈ {PSO, GWO, FA}
+Output: θ_best (optimal hyperparameters), AUPRC_best
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1:  // Data Preparation (Non-Fraud ONLY)
+2:  X_train_clean ← X_train[y_train = 0]
+3:  X_val_clean ← X_val[y_val = 0]
+4:
+5:  // Objective Function
+6:  function Evaluate(θ):
+7:      AE ← BuildAutoencoder(θ)
+8:
+9:      // Train on non-fraud data only
+10:     for epoch = 1 to MaxEpochs do
+11:         X_noisy ← X_train_clean + Noise(σ=0.1)
+12:         X_recon ← AE(X_noisy)
+13:         loss ← MSE(X_recon, X_train_clean)
+14:         Backpropagate(loss)
+15:
+16:         val_loss ← MSE(AE(X_val_clean), X_val_clean)
+17:         if val_loss improved then
+18:             SaveBestModel(AE)
+19:         end if
+20:     end for
+21:
+22:     // Evaluate on full validation set
+23:     ReconErrors ← ||X_val - AE(X_val)||²
+24:     AUPRC ← AveragePrecision(y_val, ReconErrors)
+25:
+26:     return 1 - AUPRC  // Minimize
+27: end function
+28:
+29: // Nature-Inspired Optimization
+30: Population ← Initialize(θ_search_space)
+31: for iter = 1 to MaxIterations do
+32:     for each θ_i in Population do
+33:         fitness_i ← Evaluate(θ_i)
+34:     end for
+35:     Population ← UpdateByAlgorithm(Population, fitness)
+36: end for
+37:
+38: return Best θ and AUPRC
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

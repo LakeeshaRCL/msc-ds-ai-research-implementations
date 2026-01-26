@@ -1,97 +1,38 @@
-ALGORITHM: Nature-Inspired Hyperparameter Optimization for MLP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Input: X_train, y_train, X_val, y_val, Algorithm ∈ {PSO, GWO, FA}
+Output: θ_best (optimal hyperparameters), F1_best
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-INPUTS:
-    Dataset X, y (Features and Labels)
-    Search Space Limits:
-        MIN_LAYERS = 1, MAX_LAYERS = 6
-        UNITS = [16, 24, ..., 256]
-        ACTIVATIONS = ["relu", "leaky_relu"]
-        BATCH_SIZES = [256, 512, 1024, 2048]
-    Optimizer Parameters:
-        Algorithm (e.g., PSO)
-        Population Size P
-        Iterations T
+1:  // Data Preparation
+2:  X_train_bal, y_train_bal ← SMOTE(X_train, y_train)  
+3:  // Balance classes: 50% fraud, 50% non-fraud
+4:  
+5:  // Objective Function
+6:  function Evaluate(θ):
+7:      M ← BuildMLP(θ)
+8:      
+9:      // Train on balanced data
+10:     for epoch = 1 to MaxEpochs do
+11:         Train M on (X_train_bal, y_train_bal) 
+12:         val_loss ← Validate M on (X_val, y_val)
+13:         if val_loss improved then
+14:             F1 ← ComputeF1(M, X_val, y_val)
+15:             SaveBestModel(M)
+16:         end if
+17:     end for
+18:     
+19:     return 1 - F1  // Minimize
+20: end function
+21: 
+22: // Nature-Inspired Optimization
+23: Population ← Initialize(θ_search_space)
+24: for iter = 1 to MaxIterations do
+25:     for each θ_i in Population do
+26:         fitness_i ← Evaluate(θ_i)
+27:     end for
+28:     Population ← UpdateByAlgorithm(Population, fitness)
+29: end for
+30: 
+31: return Best θ and F1
 
-OUTPUT:
-    Best Trained Model M_star
-    Test Metrics
-
-BEGIN PROCESS:
-
-    1. DEFINE OPTIMIZATION PROBLEM:
-        Variable Bounds (Vector V):
-            V[0]:     n_layers (Integer, [MIN_LAYERS, MAX_LAYERS])
-            V[1]:     dropout_rate (Float, [0.0, 0.5])
-            V[2]:     batch_norm (Boolean)
-            For i in 0 to MAX_LAYERS-1:
-                V[3 + 2*i]: units_layer_i (Categorical Index -> UNITS)
-                V[4 + 2*i]: activation_layer_i (Categorical Index -> ACTIVATIONS)
-
-    2. INITIALIZE OPTIMIZER (Mealpy):
-        Create Swarm Optimizer (e.g., PSO) with Population P, Epochs T.
-
-    3. START OPTIMIZATION LOOP (for each epoch t in 1..T):
-        
-        FOR each Agent A in Population:
-            a. DECODE PARAMETERS (Vector V -> Hyperparameters H):
-                n_layers <- Round(V[0])
-                dropout <- Clip(V[1])
-                batch_norm <- Bool(Round(V[2]))
-                network_structure <- List()
-                
-                FOR k from 0 to n_layers-1:
-                    units_k <- UNITS[V[3 + 2*k]]
-                    act_k <- ACTIVATIONS[V[4 + 2*k]]
-                    Add (units_k, act_k) to network_structure
-
-            b. EVALUATE OBJECTIVE FUNCTION (Fitness):
-                Split (X, y) into K-Fold CV (Stratified):
-                Initialize F1_scores list
-                
-                FOR each fold (Train_Fold, Val_Fold):
-                    i.  Build MLP Model M using H:
-                        Input Layer -> [Dense(units) -> BatchNorm? -> Activation -> Dropout] x n_layers -> Output(Sigmoid)
-                        Move M to DirectML Device (GPU)
-                    
-                    ii. Compute Class Weights (to handle imbalance)
-                    
-                    iii. Train M on Train_Fold:
-                        Optimizer: Adam (lr=0.001)
-                        Loss: Weighted BCEWithLogitsLoss
-                        Loop for Max Epochs (with Early Stopping on Val_Fold)
-                    
-                    iv. Validate M on Val_Fold:
-                        Compute F1 Score (Threshold=0.5)
-                        Store F1 in F1_scores
-                
-                Objective Value = 1.0 - Mean(F1_scores)
-                Return Objective Value
-
-        UPDATE Population using Swarm Intelligence Rules (Vector updates)
-        Log Global Best for Epoch t
-
-    4. EXTRACT GLOBAL BEST SOLUTION:
-        Best Vector V_star <- Optimizer.GlobalBest
-        Best Hyperparameters H_star <- Decode(V_star)
-
-    5. FINAL RETRAINING (Train on Train, Test on Test):
-        Dataset: Full X_train, y_train
-        Validation Set: Full X_test, y_test
-        
-        Build New Model M_final using H_star
-        Move to GPU
-        
-        Train M_final on X_train (Full):
-            Validation Metric: Loss on X_test
-            Early Stopping: Monitor X_test Loss
-            Save Best Checkpoint
-            
-        Load Best Checkpoint into M_final
-
-    6. FINAL EVALUATION:
-        Predict on X_test using M_final
-        Compute Classification Report (Precision, Recall, F1, Accuracy)
-        
-    RETURN M_final, Metrics
-
-END PROCESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import warnings
 import time
 import gc
+import globals.data_utils as data_utils
 
 
 # suppress directml cpu fallback warnings
@@ -358,10 +359,10 @@ def mlp_set_optimizer_objective(X_train, y_train, X_val, y_val, max_epochs, batc
     print(f"  Validation fraud rate: {val_fraud_rate_original:.4f} (should be original imbalanced)")
 
     if train_fraud_rate < 0.4 or train_fraud_rate > 0.6:
-        print("  ⚠️  WARNING: Training data doesn't appear balanced! Did you apply SMOTE?")
+        print("Training data doesn't appear balanced! Did you apply SMOTE?")
 
     if val_fraud_rate_original > 0.4:
-        print("  ⚠️  WARNING: Validation data appears balanced! It should be ORIGINAL imbalanced distribution!")
+        print("WARNING: Validation data appears balanced! It should be ORIGINAL imbalanced distribution!")
 
     # only downsamples the normal cases
     if len(X_val) > 10000:
@@ -934,38 +935,13 @@ def set_ae_optimizer_objective(X_train, y_train, X_val_clean, X_val_full, y_val_
                                                                      torch.Tensor) else y_val_full.cpu().numpy().flatten()
     X_val_full_np = np.array(X_val_full) if not isinstance(X_val_full, torch.Tensor) else X_val_full.cpu().numpy()
 
-    # CRITICAL FIX: Intelligent downsampling that preserves ALL fraud cases
-    total_val_limit = 10000  # Increased limit
+    total_val_limit = 15000  # Increased limit
 
     if len(X_val_full_np) > total_val_limit:
-        print(f"Intelligently downsampling validation set to preserve all fraud cases...")
+        print(f"Downsampling validation data")
 
-        # Separate fraud and non-fraud
-        fraud_mask = (y_val_full_np == 1)
-        X_fraud = X_val_full_np[fraud_mask]
-        y_fraud = y_val_full_np[fraud_mask]
-        X_normal = X_val_full_np[~fraud_mask]
-        y_normal = y_val_full_np[~fraud_mask]
-
-        print(f"  Original: {len(X_val_full_np)} samples ({len(X_fraud)} fraud, {len(X_normal)} normal)")
-
-        # Keep ALL fraud cases
-        # Downsample normal cases to fit within limit
-        n_normal_to_keep = min(total_val_limit - len(X_fraud), len(X_normal))
-
-        if n_normal_to_keep < len(X_normal):
-            np.random.seed(seed)
-            normal_indices = np.random.choice(len(X_normal), n_normal_to_keep, replace=False)
-            X_normal = X_normal[normal_indices]
-            y_normal = y_normal[normal_indices]
-
-        # Combine
-        X_val_opt = np.vstack([X_fraud, X_normal])
-        y_val_opt = np.concatenate([y_fraud, y_normal])
-
-        print(f"  Downsampled: {len(X_val_opt)} samples ({len(X_fraud)} fraud, {len(X_normal)} normal)")
-        print(
-            f"  Fraud retention: 100%, Normal retention: {100 * len(X_normal) / len(X_val_full_np[~fraud_mask]):.1f}%")
+        X_val_opt, y_val_opt = data_utils.get_stratified_sample(X_val_full, y_val_full, total_val_limit)
+        data_utils.show_class_distribution(X_val_opt, y_val_opt, "Downsampled validation data")
     else:
         X_val_opt = X_val_full_np
         y_val_opt = y_val_full_np
@@ -1078,11 +1054,11 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     print(f"FINAL AE TRAINING (Max Epochs: {max_epochs})")
     print("=" * 60)
 
-    # handle hyperparameter format
+    # Handle hyperparameter format
     if isinstance(best_hp, (tuple, list)) and len(best_hp) >= 3:
         best_hp = best_hp[2]
 
-    # define device
+    # Define device
     try:
         device = select_device()
     except:
@@ -1090,9 +1066,9 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
 
     print(f"Training on device: {device}")
 
-
-    # 1: filter training data by removing fraud samples
-
+    # ============================================================
+    # STEP 1: Filter Training Data - Remove Fraud Samples
+    # ============================================================
     y_train_flat = np.array(y_train).flatten()
     mask_train = (y_train_flat == 0)
     n_fraud_removed = len(y_train_flat) - np.sum(mask_train)
@@ -1105,8 +1081,9 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
 
     print(f"  Final training size (non-fraud only): {len(X_train)}")
 
-    # 2: filter validation data for early stopping
-
+    # ============================================================
+    # STEP 2: Filter Validation Data for Early Stopping
+    # ============================================================
     y_val_flat = np.array(y_val).flatten()
     mask_val_clean = (y_val_flat == 0)
     X_val_clean = X_val[mask_val_clean]
@@ -1116,8 +1093,9 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     print(f"  For early stopping (non-fraud only): {len(X_val_clean)}")
     print(f"  For AUPRC evaluation (full set): {len(y_val_flat)} ({n_val_fraud} fraud samples)")
 
-
-    # 3: prepare data loaders and tensors for pytorch
+    # ============================================================
+    # STEP 3: Prepare Data Loaders and Tensors
+    # ============================================================
     X_train_tensor = torch.from_numpy(X_train).float()
     train_dataset = TensorDataset(X_train_tensor)
 
@@ -1130,33 +1108,33 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
         drop_last=True
     )
 
-    # define two validation tensors:
-
-    # A. validation for early stopping (non-fraud only)
+    # Two validation tensors:
+    # A. Clean validation for early stopping (non-fraud only)
     X_val_clean_t = torch.tensor(X_val_clean, dtype=torch.float32).to(device)
 
-    # B. full validation for AUPRC evaluation (fraud + non-fraud)
+    # B. Full validation for AUPRC evaluation (fraud + non-fraud)
     X_val_full_t = torch.tensor(X_val, dtype=torch.float32).to(device)
 
-    # define test tensor (full test set)
+    # Test tensor (full test set)
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
     y_test_flat = np.array(y_test).flatten()
 
-
-    # 4: build final autoencoder model
+    # ============================================================
+    # STEP 4: Build Model and Optimizer
+    # ============================================================
     model = build_ae_model(best_hp, X_train.shape[1])
     model.to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     criterion = nn.MSELoss()
 
-    # set early stopping parameters
+    # Early stopping parameters
     best_val_loss = float('inf')
     best_state = None
     patience = 0
     patience_limit = 10
 
-    input_noise_std = 0.1  # add denoising factor (denoising autoencoder)
+    input_noise_std = 0.1  # Denoising autoencoder
 
     print(f"\nTraining Configuration:")
     print(f"  Noise std: {input_noise_std}")
@@ -1165,27 +1143,30 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     print(f"  Optimizer: Adam (lr=0.001, weight_decay=1e-5)")
     print(f"\nStarting training...")
 
-    # 5: model training with early stopping
+    # ============================================================
+    # STEP 5: Training Loop with Early Stopping
+    # ============================================================
     for epoch in range(max_epochs):
         model.train()
         train_loss = 0.0
         batches = 0
 
-        # training batch loop
+        # Training batches
         for batch_data in train_loader:
             batch_x = batch_data[0].to(device, non_blocking=True)
 
+            # Add noise for denoising autoencoder
             if input_noise_std > 0:
                 noisy_x = batch_x + torch.randn_like(batch_x) * input_noise_std
             else:
                 noisy_x = batch_x
 
-            # forward pass
+            # Forward pass
             optimizer.zero_grad()
             recon = model(noisy_x)
             loss = criterion(recon, batch_x)  # Reconstruct clean from noisy
 
-            # backward pass
+            # Backward pass
             loss.backward()
             optimizer.step()
 
@@ -1194,14 +1175,14 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
 
         avg_train_loss = train_loss / batches if batches > 0 else 0
 
-        # get validation loss on clean data for early stopping
+        # CRITICAL: Validation loss on CLEAN data only (early stopping)
         val_loss = batched_reconstruction_loss(model, X_val_clean_t, batch_size)
 
-        # print progress every 5 epochs
+        # Print progress every 5 epochs
         if epoch % 5 == 0:
-            print(f"Epoch {epoch + 1}/{max_epochs}: Train Loss={avg_train_loss:.6f}, Val Loss (clean)={val_loss:.6f} \n")
+            print(f"Epoch {epoch + 1}/{max_epochs}: Train Loss={avg_train_loss:.6f}, Val Loss (clean)={val_loss:.6f}")
 
-        # early stopping logic
+        # Early stopping logic
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = model.state_dict()
@@ -1209,20 +1190,22 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
         else:
             patience += 1
             if patience >= patience_limit:
-                print(f"Early stopping triggered at epoch {epoch + 1}")
+                print(f"\nEarly stopping triggered at epoch {epoch + 1}")
                 break
 
-    # get best model state
+    # Load best model state
     if best_state:
         model.load_state_dict(best_state)
         print(f"Loaded best model (Val Loss: {best_val_loss:.6f})")
 
-    # save model if path provided
+    # Save model if path provided
     if save_path:
         torch.save(model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
 
-    #  6: evaluate the model on validation set
+    # ============================================================
+    # STEP 6: Evaluate on VALIDATION Set
+    # ============================================================
     print("\n" + "=" * 60)
     print("VALIDATION SET EVALUATION")
     print("=" * 60)
@@ -1231,21 +1214,33 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
         recon_errors_val = get_reconstruction_errors(model, X_val_full_t, batch_size)
 
     try:
-        from sklearn.metrics import roc_auc_score, average_precision_score
+        from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score
+
         auprc_val = average_precision_score(y_val_flat, recon_errors_val)
         auc_val = roc_auc_score(y_val_flat, recon_errors_val)
         fraud_rate_val = y_val_flat.mean()
 
-        print(f"Validation AUPRC:      {auprc_val:.4f}")
-        print(f"Validation Baseline:   {fraud_rate_val:.4f}")
+        # Calculate accuracy at optimal threshold
+        thresh_val, f1_val, metrics_val = evaluations.find_optimal_threshold(y_val_flat, recon_errors_val)
+        y_pred_val = (recon_errors_val >= thresh_val).astype(int)
+        acc_val = accuracy_score(y_val_flat, y_pred_val)
+
+        print(f"Validation AUPRC:        {auprc_val:.4f}")
+        print(f"Validation Baseline:     {fraud_rate_val:.4f}")
         print(f"Improvement over random: {auprc_val / fraud_rate_val:.2f}x")
-        print(f"Validation ROC-AUC:    {auc_val:.4f}")
+        print(f"Validation ROC-AUC:      {auc_val:.4f}")
+        print(f"Validation Accuracy:     {acc_val:.4f} (at threshold {thresh_val:.6f})")
+        print(f"Validation F1:           {f1_val:.4f}")
     except Exception as e:
         print(f"Could not calculate validation metrics: {e}")
         auprc_val = None
         auc_val = None
+        acc_val = None
+        f1_val = None
 
-    # STEP 7: evaluate the model on the test set (final performance test)
+    # ============================================================
+    # STEP 7: Evaluate on TEST Set (Final Performance)
+    # ============================================================
     print("\n" + "=" * 60)
     print("TEST SET EVALUATION (Final Performance)")
     print("=" * 60)
@@ -1253,23 +1248,32 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     with torch.no_grad():
         recon_errors_test = get_reconstruction_errors(model, X_test_t, batch_size)
 
-    # get optimal threshold on test set
+    # Find optimal threshold on test set
     thresh, f1, best_metrics = evaluations.find_optimal_threshold(y_test_flat, recon_errors_test)
 
-    # calculate AUPRC and ROC-AUC metrics on test set
+    # Calculate AUPRC, ROC-AUC, and Accuracy
     try:
-        from sklearn.metrics import roc_auc_score, average_precision_score
+        from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score
+
         auc_test = roc_auc_score(y_test_flat, recon_errors_test)
         auprc_test = average_precision_score(y_test_flat, recon_errors_test)
         fraud_rate_test = y_test_flat.mean()
+
+        # Calculate accuracy at optimal threshold
+        y_pred_test = (recon_errors_test >= thresh).astype(int)
+        acc_test = accuracy_score(y_test_flat, y_pred_test)
+
     except Exception as e:
         print(f"Error calculating test metrics: {e}")
         auc_test = None
         auprc_test = None
         fraud_rate_test = None
+        acc_test = None
 
-    # display results
-    print(f"\n{'PRIMARY METRIC (Optimization Objective)':^60}")
+    # ============================================================
+    # STEP 8: Display Results
+    # ============================================================
+    print(f"\n{'PRIMARY METRICS (Threshold-Independent)':^60}")
     print("-" * 60)
     if auprc_test is not None and fraud_rate_test is not None:
         print(f"  Test AUPRC:            {auprc_test:.4f}")
@@ -1284,27 +1288,35 @@ def train_final_ae_model(best_hp, X_train, y_train, X_val, y_val, X_test, y_test
     print(f"\n{'THRESHOLD-DEPENDENT METRICS':^60}")
     print("-" * 60)
     print(f"  Optimal Threshold:     {thresh:.6f}")
+    if acc_test is not None:
+        print(f"  Accuracy:              {acc_test:.4f}")
     print(f"  F1 Score:              {f1:.4f}")
     print(f"  Precision:             {best_metrics['precision']:.4f}")
     print(f"  Recall:                {best_metrics['recall']:.4f}")
 
-
-    # return model and evaluation metrics
+    # ============================================================
+    # STEP 9: Return Model and Comprehensive Metrics
+    # ============================================================
     metrics = {
-        # test set metrics
+        # Test set metrics (threshold-independent)
         "test_auprc": auprc_test,
         "test_roc_auc": auc_test,
         "test_fraud_rate": fraud_rate_test,
+
+        # Test set metrics (threshold-dependent)
         "optimal_threshold": thresh,
+        "optimal_accuracy": acc_test,
         "optimal_f1": f1,
         "optimal_precision": best_metrics['precision'],
         "optimal_recall": best_metrics['recall'],
 
-        # validation set metrics (for comparison)
+        # Validation set metrics (for comparison)
         "val_auprc": auprc_val,
         "val_roc_auc": auc_val,
+        "val_accuracy": acc_val,
+        "val_f1": f1_val,
 
-        # these metrics can be used to achieve backward compatibility
+        # Backward compatibility
         "optimal_auprc": auprc_test,
         "optimal_roc_auc": auc_test,
     }
