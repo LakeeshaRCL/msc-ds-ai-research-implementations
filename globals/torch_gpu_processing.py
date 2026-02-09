@@ -11,6 +11,7 @@ import warnings
 import time
 import gc
 import globals.data_utils as data_utils
+import os
 
 
 # suppress directml cpu fallback warnings
@@ -906,10 +907,7 @@ def get_reconstruction_errors(model, X_tensor, batch_size=1024):
 def set_ae_optimizer_objective(X_train, y_train, X_val_clean, X_val_full, y_val_full,
                                max_epochs, batch_size, seed, early_stopping_patience, force_cpu=False):
     """
-    X_train: Non-fraud training data only
-    X_val_clean: Non-fraud validation data for early stopping
-    X_val_full: Full validation data (fraud + non-fraud) for AUPRC
-    y_val_full: Full validation labels for AUPRC
+    FIXED: Proper DirectML handling + speed optimizations
     """
     use_gpu = (not force_cpu) and (torch.cuda.is_available() or torch_directml.device() is not None)
 
@@ -917,42 +915,40 @@ def set_ae_optimizer_objective(X_train, y_train, X_val_clean, X_val_full, y_val_
         try:
             device = select_device()
             if device.type == 'privateuseone':
-                print("Warning: DirectML detected. If unstable, consider forcing CPU.")
+                print("DirectML: Using optimized DataLoader + clipping")
+                autocast_enabled = False  # DirectML limitation
+            else:
+                print(f"GPU: {device} - Full mixed precision")
+                autocast_enabled = True
             print(f"Optimizer using DEVICE: {device}")
         except:
             device = torch.device('cpu')
-            print("Optimizer fell back to CPU.")
+            autocast_enabled = False
     else:
         device = torch.device('cpu')
-        print("Optimizer using CPU.")
+        autocast_enabled = False
 
-    # Prepare validation data for early stopping (non-fraud only)
+    # Data prep (optimized)
     X_val_clean_np = np.array(X_val_clean) if not isinstance(X_val_clean, torch.Tensor) else X_val_clean.cpu().numpy()
     X_val_clean_t = torch.tensor(X_val_clean_np, dtype=torch.float32).to(device)
 
-    # Prepare full validation data for AUPRC (fraud + non-fraud)
     y_val_full_np = np.array(y_val_full).flatten() if not isinstance(y_val_full,
                                                                      torch.Tensor) else y_val_full.cpu().numpy().flatten()
     X_val_full_np = np.array(X_val_full) if not isinstance(X_val_full, torch.Tensor) else X_val_full.cpu().numpy()
 
-    total_val_limit = 15000  # Increased limit
-
+    total_val_limit = 20000
     if len(X_val_full_np) > total_val_limit:
-        print(f"Downsampling validation data")
-
         X_val_opt, y_val_opt = data_utils.get_stratified_sample(X_val_full, y_val_full, total_val_limit)
         data_utils.show_class_distribution(X_val_opt, y_val_opt, "Downsampled validation data")
     else:
-        X_val_opt = X_val_full_np
-        y_val_opt = y_val_full_np
+        X_val_opt, y_val_opt = X_val_full_np, y_val_full_np
 
     X_val_opt_t = torch.tensor(X_val_opt, dtype=torch.float32).to(device)
 
-    # Training dataloader
     X_train_tensor = torch.from_numpy(X_train).float()
     train_dataset = TensorDataset(X_train_tensor)
 
-    input_noise_std = 0.1
+    base_noise_std = 0.15
 
     def obj(vec):
         gc.collect()
@@ -968,9 +964,20 @@ def set_ae_optimizer_objective(X_train, y_train, X_val_clean, X_val_full, y_val_
             optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
             criterion = nn.MSELoss()
 
-            use_pin = (device.type != 'cpu') and (device.type != 'privateuseone')
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                                      pin_memory=use_pin, drop_last=True)
+            # *** FIXED MIXED PRECISION SETUP ***
+            scaler = None
+            if autocast_enabled and device.type == 'cuda':
+                scaler = torch.cuda.amp.GradScaler()
+
+            # *** OPTIMIZED DATALOADER ***
+            use_pin = device.type != 'cpu'
+            train_loader = DataLoader(train_dataset,
+                                      batch_size=batch_size,
+                                      shuffle=True,
+                                      num_workers=min(4, os.cpu_count() or 1),  # Safe workers
+                                      pin_memory=use_pin,
+                                      persistent_workers=use_pin,
+                                      prefetch_factor=2)
 
             best_val_loss = float('inf')
             patience = 0
@@ -978,21 +985,32 @@ def set_ae_optimizer_objective(X_train, y_train, X_val_clean, X_val_full, y_val_
 
             for epoch in range(max_epochs):
                 model.train()
-                for batch_data in train_loader:
-                    batch_x = batch_data[0].to(device, non_blocking=False)
+                epoch_noise_std = base_noise_std * (0.5 + epoch / max_epochs * 1.5)  # Denoising ramp
 
-                    if input_noise_std > 0:
-                        noisy_x = batch_x + torch.randn_like(batch_x) * input_noise_std
-                    else:
-                        noisy_x = batch_x
+                for batch_idx, batch_data in enumerate(train_loader):
+                    batch_x = batch_data[0].to(device, non_blocking=use_pin)
+                    noisy_x = batch_x + torch.randn_like(batch_x) * epoch_noise_std
 
                     optimizer.zero_grad()
-                    recon = model(noisy_x)
-                    loss = criterion(recon, batch_x)
-                    loss.backward()
-                    optimizer.step()
 
-                # CRITICAL FIX: Early stopping on CLEAN validation data only
+                    # *** SAFE FORWARD PASS ***
+                    if autocast_enabled and scaler:
+                        with torch.cuda.amp.autocast():
+                            recon = model(noisy_x)
+                            loss = criterion(recon, batch_x)
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # Standard training (DirectML/CPU)
+                        recon = model(noisy_x)
+                        loss = criterion(recon, batch_x)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
+
                 val_loss = batched_reconstruction_loss(model, X_val_clean_t, batch_size)
                 print(".", end="", flush=True)
 
@@ -1008,33 +1026,32 @@ def set_ae_optimizer_objective(X_train, y_train, X_val_clean, X_val_full, y_val_
             if best_state:
                 model.load_state_dict(best_state)
 
-            # CRITICAL: Compute AUPRC on full validation set (with all fraud cases)
             with torch.no_grad():
                 recon_errors = get_reconstruction_errors(model, X_val_opt_t, batch_size)
 
-            # Calculate Metrics
             auprc = evaluations.average_precision_score(y_val_opt, recon_errors)
-
             try:
                 roc_auc = evaluations.roc_auc_score(y_val_opt, recon_errors)
             except:
                 roc_auc = 0.5
 
             best_thresh, best_f1, best_metrics = evaluations.find_optimal_threshold(y_val_opt, recon_errors)
-
             fraud_rate = y_val_opt.mean()
             print(f" [AUPRC: {auprc:.4f} (baseline: {fraud_rate:.4f}) | F1: {best_f1:.4f} | ROC: {roc_auc:.4f}]",
                   end="")
 
-            del model
-            del optimizer
+            # Cleanup
+            del model, optimizer, train_loader
+            if scaler:
+                del scaler
 
             return 1.0 - auprc
 
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print("| OOM |", end="")
-                if hasattr(torch.cuda, 'empty_cache'): torch.cuda.empty_cache()
+                if hasattr(torch.cuda, 'empty_cache'):
+                    torch.cuda.empty_cache()
                 return 1.0
             else:
                 print(f"Error: {e}")

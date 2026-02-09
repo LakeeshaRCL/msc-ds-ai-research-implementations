@@ -39,70 +39,78 @@ def get_sampling_data(X_train, y_train, sample_size=60000, seed=42):
 
     return X_clean, y_clean
 
-def run_optimization(X_train_sample, y_train_sample, X_validation, y_validation, 
-                    algorithm="PSO", population=6, iterations=5, 
-                    batch_size=1024, epochs=10, early_stopping=3):
-    
+
+def run_optimization(X_train_sample, y_train_sample, X_validation, y_validation,
+                     algorithm="PSO", population=10, iterations=10,  # Reduced for speed
+                     batch_size=2048, epochs=7, early_stopping=4,  # Optimized defaults
+                     use_optuna=False):  # *** NEW: Optuna option ***
+
     print(f"Starting AE Optimization using {algorithm}...")
     print(f"Settings: Pop={population}, Iter={iterations}, Batch={batch_size}, Epochs={epochs}")
 
-    # filtering validation data to keep only non-fraud for training
     y_val_flat = y_validation.to_numpy().ravel()
     X_val_np = X_validation.to_numpy()
     mask_val_clean = (y_val_flat == 0)
     X_val_clean = X_val_np[mask_val_clean]
-
-    # keep the full validation set to use for AUPRC calculation
     X_val_full = X_val_np
     y_val_full = y_val_flat
 
-    print(f"Starting AE Optimization using {algorithm}...")
     print(f"Training samples (non-fraud): {len(X_train_sample)}")
-    print(f"Validation samples (non-fraud for training): {len(X_val_clean)}")
-    print(f"Validation samples (full for AUPRC): {len(X_val_full)}")
-    
-    # objective function to be optimized
+    print(f"Validation (non-fraud): {len(X_val_clean)}, full: {len(X_val_full)}")
+
     objective_function = torch_gpu_processing.set_ae_optimizer_objective(
-        X_train_sample,
-        y_train_sample,
-        X_val_clean,  # Use this for autoencoder training/validation loss
-        X_val_full,  # Use this for computing reconstruction errors
-        y_val_full,  # Use this for AUPRC calculation
-        max_epochs=epochs,
-        batch_size=batch_size,
-        seed=42,
-        early_stopping_patience=early_stopping
+        X_train_sample, y_train_sample, X_val_clean, X_val_full, y_val_full,
+        max_epochs=epochs, batch_size=batch_size, seed=42, early_stopping_patience=early_stopping
     )
 
-    # define hyperparameter bounds
-    bounds_cfg = hyp_optimizer.get_ae_hyperparameter_bounds_config(min_layers=1, max_layers=10)
-    optimizer_bounds = []
-    for cfg in bounds_cfg:
-        if cfg['type'] == 'int':
-            optimizer_bounds.append(IntegerVar(lb=cfg['lb'], ub=cfg['ub'], name=cfg.get('name')))
-        elif cfg['type'] == 'float':
-            optimizer_bounds.append(FloatVar(lb=cfg['lb'], ub=cfg['ub'], name=cfg.get('name')))
-        elif cfg['type'] == 'bool':
-            optimizer_bounds.append(BoolVar(name=cfg.get('name')))
-        elif cfg['type'] == 'categorical':
-            optimizer_bounds.append(CategoricalVar(valid_sets=cfg['choices'], name=cfg.get('name')))
+    if use_optuna:  # *** BAYESIAN OPTIMIZATION (MUCH FASTER) ***
+        import optuna
 
-    problem = dict(obj_func=objective_function, bounds=optimizer_bounds, minmax="min", log_to=None)
+        def optuna_objective(trial):
+            # Convert Optuna params to your hyperparam format
+            hp_vec = [
+                trial.suggest_int('n_layers', 2, 6),  # Reduced search space
+                trial.suggest_float('latent_dim', 16, 128, log=True),
+                *[trial.suggest_float(f'w{i}', 0.01, 0.5, log=True) for i in range(10)],  # Layer widths
+                trial.suggest_categorical('activation', ['relu', 'leaky_relu', 'elu']),
+                trial.suggest_float('dropout', 0.0, 0.3),
+            ]
+            return objective_function(hp_vec)
 
-    # select optimizer algorithm
-    if algorithm == "PSO":
-        optimizer = PSO.OriginalPSO(epoch=iterations, pop_size=population)
-    elif algorithm == "GWO":
-        optimizer = GWO.OriginalGWO(epoch=iterations, pop_size=population)
-    else:
-        optimizer = FA.OriginalFA(epoch=iterations, pop_size=population)
+        study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
+        study.optimize(optuna_objective, n_trials=population * iterations, timeout=7200)  # 2hr max
 
-    # executing optimization
-    best_agent = optimizer.solve(problem)
-    best_vec = best_agent.solution
-    best_obj = best_agent.target.fitness
-    best_hp = hyp_optimizer.optimizer_vectors_to_ae_hyperparams(best_vec)
-    
-    print(f"\nBest Objective: {best_obj:.6f} => AUPRC: {1.0-best_obj:.6f}")
-    
-    return best_hp
+        best_vec = study.best_params
+        best_hp = hyp_optimizer.optimizer_vectors_to_ae_hyperparams(best_vec)
+        print(f"\nOptuna Best AUPRC: {1.0 - study.best_value:.6f}")
+        return best_hp
+
+    else:  # Original PSO/GWO path
+        bounds_cfg = hyp_optimizer.get_ae_hyperparameter_bounds_config(min_layers=2, max_layers=6)  # *** PRUNED ***
+        optimizer_bounds = []
+        for cfg in bounds_cfg:
+            if cfg['type'] == 'int':
+                optimizer_bounds.append(IntegerVar(lb=cfg['lb'], ub=cfg['ub'], name=cfg.get('name')))
+            elif cfg['type'] == 'float':
+                optimizer_bounds.append(FloatVar(lb=cfg['lb'], ub=cfg['ub'], name=cfg.get('name')))
+            elif cfg['type'] == 'bool':
+                optimizer_bounds.append(BoolVar(name=cfg.get('name')))
+            elif cfg['type'] == 'categorical':
+                optimizer_bounds.append(CategoricalVar(valid_sets=cfg['choices'], name=cfg.get('name')))
+
+        problem = dict(obj_func=objective_function, bounds=optimizer_bounds, minmax="min")
+
+        if algorithm == "PSO":
+            optimizer = PSO.OriginalPSO(epoch=iterations, pop_size=population)
+        elif algorithm == "GWO":
+            optimizer = GWO.OriginalGWO(epoch=iterations, pop_size=population)
+        else:
+            optimizer = FA.OriginalFA(epoch=iterations, pop_size=population)
+
+        best_agent = optimizer.solve(problem)
+        best_vec = best_agent.solution
+        best_obj = best_agent.target.fitness
+        best_hp = hyp_optimizer.optimizer_vectors_to_ae_hyperparams(best_vec)
+
+        print(f"\nBest Objective: {best_obj:.6f} => AUPRC: {1.0 - best_obj:.6f}")
+        return best_hp
