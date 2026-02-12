@@ -75,13 +75,9 @@ class SHAPExplainer:
         plt.figure()
         shap.summary_plot(shap_vals_to_plot, self.test_samples, feature_names=self.feature_names)
         plt.show()
-        
-    def show_local_interpretability(self, instance_idx):
-        if self.shap_values is None:
-            raise ValueError("SHAP values have not been computed yet. Call explain() first.")
-        # Local interpretability: Force plot for a specific instance
 
-        print(f"SHAP Force Plot for instance: {instance_idx}:")
+    def get_instance_and_base_shap_values(self, instance_idx):
+        print(f"Instance: {instance_idx}:")
 
         # Robust selection for Class 1 (Fraud)
         if isinstance(self.shap_values, list):
@@ -99,6 +95,20 @@ class SHAPExplainer:
                 base_value = base_value[1]
             shap_vals = self.shap_values[instance_idx, :]
 
+        print(f"Base value: {base_value}")
+        print(f"SHAP values for instance {instance_idx}: {shap_vals}")
+        return base_value, shap_vals
+
+
+    def show_local_interpretability(self, instance_idx):
+        if self.shap_values is None:
+            raise ValueError("SHAP values have not been computed yet. Call explain() first.")
+        # Local interpretability: Force plot for a specific instance
+
+        print(f"SHAP Force Plot for instance: {instance_idx}:")
+
+        base_value, shap_vals = self.get_instance_and_base_shap_values(instance_idx)
+
         print(f"Base value used: {base_value}")
         shap.force_plot(base_value, shap_vals, self.test_samples.iloc[instance_idx, :], matplotlib=True,
                         feature_names=self.feature_names)
@@ -111,7 +121,7 @@ class SHAPExplainer:
         instance_data = self.test_samples.iloc[instance_idx]
 
         # Get SHAP values for this instance (already calculated above as shap_vals)
-        instance_shap_values = self.shap_values[instance_idx, :]
+        base_value, instance_shap_values = self.get_instance_and_base_shap_values(instance_idx)
 
         # Create a DataFrame for better readability
         feature_influence_df = pd.DataFrame({
