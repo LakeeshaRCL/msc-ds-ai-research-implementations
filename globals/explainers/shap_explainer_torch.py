@@ -1,4 +1,5 @@
 import shap
+import copy
 import time
 import matplotlib.pyplot as plt
 import torch
@@ -37,6 +38,7 @@ class SHAPExplainerTorch:
         self.shap_explainer = None
         self.shap_values = None
         self.test_samples = None
+        self._expected_value = None
         
         self.device = shared_select_device()
         self.model.to(self.device)
@@ -44,8 +46,12 @@ class SHAPExplainerTorch:
 
     def explain(self, test_samples_count=20, background_size=100):
         """
-        Compute SHAP values using DeepExplainer.
-        
+        Compute SHAP values using DeepExplainer, with GradientExplainer fallback.
+
+        DeepExplainer may fail for models that use activations it cannot
+        symbolically propagate (e.g. SiLU). In that case, GradientExplainer
+        is used automatically.
+
         Parameters:
         -----------
         test_samples_count : int
@@ -54,73 +60,112 @@ class SHAPExplainerTorch:
             Number of background samples to use (subset of X_train)
         """
         shap.initjs()
-        
+
         print(f"\n{'=' * 70}")
         print(f"Computing SHAP Explanations for PyTorch Model")
-        print(f"Using DeepExplainer")
         print(f"{'=' * 70}")
-        
+
         # Prepare background data
         if hasattr(self.X_train, 'values'):
             X_train_np = self.X_train.values
         else:
             X_train_np = self.X_train
-            
-        # Select background samples
+
         if len(X_train_np) > background_size:
             background_data = X_train_np[:background_size]
         else:
             background_data = X_train_np
-            
-        # Convert background to tensor
-        background_tensor = torch.tensor(background_data, dtype=torch.float32).to(self.device)
-        
-        print("Creating DeepExplainer...")
-        start_time = time.time()
-        
-        try:
-            # value of DeepExplainer is expected to be a tensor or list of tensors
-            self.shap_explainer = shap.DeepExplainer(self.model, background_tensor)
-            print(f"    Using {len(background_data)} background samples")
-        except Exception as e:
-            print(f"Error initializing DeepExplainer: {e}")
-            return
 
-        shap_init_time = time.time() - start_time
-        print(f"\n    Explainer initialization time: {shap_init_time:.2f} seconds")
-
-        # Select test samples
+        # Select test samples early so we have them regardless of explainer path
         if hasattr(self.X_test, 'iloc'):
             self.test_samples = self.X_test.iloc[:test_samples_count, :]
             test_samples_np = self.test_samples.values
         else:
-            self.test_samples = pd.DataFrame(self.X_test[:test_samples_count], columns=self.feature_names)
+            self.test_samples = pd.DataFrame(
+                self.X_test[:test_samples_count], columns=self.feature_names
+            )
             test_samples_np = self.test_samples.values
-            
-        test_tensor = torch.tensor(test_samples_np, dtype=torch.float32).to(self.device)
-        
-        print(f"\nCalculating SHAP values for {test_samples_count} test samples...")
-        start_time = time.time()
-        
-        # Compute SHAP values
-        # shap_values from DeepExplainer will be a list of numpy arrays (for each output)
-        # or a single numpy array
-        try:
-            shap_values_raw = self.shap_explainer.shap_values(test_tensor)
-            
-            # Post-processing to ensure consistent format with original SHAP wrapper
-            if isinstance(shap_values_raw, list):
-                self.shap_values = shap_values_raw
+
+        # ------------------------------------------------------------------
+        # Try DeepExplainer first; fall back to GradientExplainer if it fails
+        # (DeepExplainer cannot handle SiLU and raises a sum-check error)
+        # ------------------------------------------------------------------
+        def _try_deep_explainer(bg_tensor, test_tensor):
+            print("Using DeepExplainer")
+            print("Creating DeepExplainer...")
+            explainer = shap.DeepExplainer(self.model, bg_tensor)
+            print(f"    Using {len(background_data)} background samples")
+            shap_vals = explainer.shap_values(test_tensor)
+            return explainer, shap_vals
+
+        def _try_gradient_explainer(bg_tensor, test_tensor):
+            print("Using GradientExplainer (fallback – model has unsupported activations for DeepExplainer)")
+            print("Creating GradientExplainer...")
+            explainer = shap.GradientExplainer(self.model, bg_tensor)
+            print(f"    Using {len(background_data)} background samples")
+            shap_vals = explainer.shap_values(test_tensor)
+            return explainer, shap_vals
+
+        # ------------------------------------------------------------------
+        # Compute _expected_value on the ORIGINAL device first.
+        # We do this before creating the CPU copy so we never mix DML model
+        # weights with CPU tensors (which causes a DirectML assertion error).
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            bg_tensor_dev = torch.tensor(background_data, dtype=torch.float32).to(self.device)
+            bg_out = self.model(bg_tensor_dev)
+            if bg_out.ndim > 1 and bg_out.shape[1] > 1:
+                self._expected_value = bg_out.mean(dim=0).cpu().numpy().tolist()
             else:
-                self.shap_values = shap_values_raw
-                
-        except Exception as e:
-            print(f"Error computing SHAP values: {e}")
-            return
+                self._expected_value = float(bg_out.mean().cpu().numpy())
+
+        # ------------------------------------------------------------------
+        # Build a true CPU copy of the model for SHAP.
+        # DirectML's .cpu() does NOT detach weights from the DML device, so
+        # we must deepcopy then explicitly move to 'cpu'.
+        # ------------------------------------------------------------------
+        cpu_model = copy.deepcopy(self.model).to('cpu')
+        cpu_model.eval()
+        bg_tensor = torch.tensor(background_data, dtype=torch.float32).cpu()
+        test_tensor = torch.tensor(test_samples_np, dtype=torch.float32).cpu()
+
+        # Temporarily point self.model at the cpu_model so that the nested
+        # helper functions (_try_deep_explainer / _try_gradient_explainer)
+        # reference the CPU copy, not the DML original.
+        _orig_model = self.model
+        self.model = cpu_model
+
+        start_time = time.time()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", message=".*unrecognized nn.Module.*")
+                self.shap_explainer, shap_values_raw = _try_deep_explainer(bg_tensor, test_tensor)
+        except Exception as deep_err:
+            print(f"    DeepExplainer issue: {deep_err}")
+            try:
+                self.shap_explainer, shap_values_raw = _try_gradient_explainer(bg_tensor, test_tensor)
+            except Exception as grad_err:
+                print(f"Error computing SHAP values with GradientExplainer: {grad_err}")
+                self.model = _orig_model
+                return
+
+        # Restore the original (DML) model reference
+        self.model = _orig_model
+
+        # If DeepExplainer succeeded it has its own expected_value; prefer it.
+        if hasattr(self.shap_explainer, 'expected_value'):
+            self._expected_value = self.shap_explainer.expected_value
+
+        shap_init_time = time.time() - start_time
+        print(f"\n    Explainer initialization time: {shap_init_time:.2f} seconds")
+
+        print(f"\nCalculating SHAP values for {test_samples_count} test samples...")
+
+        self.shap_values = shap_values_raw
 
         shap_compute_time = time.time() - start_time
         print(f"    SHAP values computation time: {shap_compute_time:.2f} seconds")
-        
+
         # Display statistics
         if isinstance(self.shap_values, list):
             print(f"  SHAP values shape: {len(self.shap_values)} classes")
@@ -128,7 +173,7 @@ class SHAPExplainerTorch:
                 print(f"    Class {i}: {sv.shape}")
         else:
             print(f"  SHAP values shape: {self.shap_values.shape}")
-            
+
         print(f"{'=' * 70}\n")
         
     def show_summary_plot(self):
@@ -162,19 +207,12 @@ class SHAPExplainerTorch:
             return
 
         # Handle different structures
+        ev = self._expected_value
         if isinstance(self.shap_values, list):
-             # Binary: expected_value is also a list usually, or single value depending on version
-            if isinstance(self.shap_explainer.expected_value, list):
-                base_value = self.shap_explainer.expected_value[1]
-            else:
-                base_value = self.shap_explainer.expected_value
-                
+            base_value = ev[1] if isinstance(ev, (list, np.ndarray)) and len(ev) > 1 else (ev[0] if isinstance(ev, (list, np.ndarray)) else ev)
             shap_values = self.shap_values[1][instance_idx]
         else:
-            if isinstance(self.shap_explainer.expected_value, list):
-                 base_value = self.shap_explainer.expected_value[0]
-            else:
-                base_value = self.shap_explainer.expected_value
+            base_value = ev[0] if isinstance(ev, (list, np.ndarray)) else ev
             shap_values = self.shap_values[instance_idx]
 
         shap.force_plot(
@@ -252,28 +290,26 @@ class SHAPExplainerTorch:
         print(f"\nExtracting SHAP values for instance {instance_idx}:")
 
         # Handle different SHAP value formats
+        ev = self._expected_value
         if isinstance(self.shap_values, list):
             # Binary classification with list format
             if len(self.shap_values) > 1:
-                base_value = self.shap_explainer.expected_value[1]
+                base_value = ev[1] if isinstance(ev, (list, np.ndarray)) and len(ev) > 1 else (ev[0] if isinstance(ev, (list, np.ndarray)) else ev)
                 shap_vals = self.shap_values[1][instance_idx, :]
             else:
-                base_value = self.shap_explainer.expected_value[0] if isinstance(self.shap_explainer.expected_value, (list, np.ndarray)) else self.shap_explainer.expected_value
+                base_value = ev[0] if isinstance(ev, (list, np.ndarray)) else ev
                 shap_vals = self.shap_values[0][instance_idx, :]
         elif len(self.shap_values.shape) == 3:
             # Multi-dimensional array (samples, features, classes)
             class_idx = 1 if self.shap_values.shape[2] > 1 else 0
-            if isinstance(self.shap_explainer.expected_value, (list, np.ndarray)):
-                ev = self.shap_explainer.expected_value
+            if isinstance(ev, (list, np.ndarray)):
                 base_value = ev[class_idx] if len(ev) > class_idx else ev[0]
             else:
-                base_value = self.shap_explainer.expected_value
+                base_value = ev
             shap_vals = self.shap_values[instance_idx, :, class_idx]
         else:
             # 2D array format
-            base_value = self.shap_explainer.expected_value
-            if isinstance(base_value, (list, np.ndarray)):
-                base_value = base_value[1] if len(base_value) > 1 else base_value[0]
+            base_value = ev[1] if isinstance(ev, (list, np.ndarray)) and len(ev) > 1 else (ev[0] if isinstance(ev, (list, np.ndarray)) else ev)
             shap_vals = self.shap_values[instance_idx, :]
 
         print(f"  Base value (expected): {base_value:.4f}")

@@ -40,30 +40,41 @@ class LimeExplainerTorch:
     def _predict_proba(self, X_numpy):
         """
         Internal prediction wrapper for LIME.
-        Converts numpy array to tensor, runs inference, and formats output.
+        Converts numpy array to tensor, runs inference, and returns a
+        valid [N, 2] probability matrix for LIME.
+
+        Handles three output shapes:
+        - (N, 1)  : sigmoid classifier  → P(class1) = output
+        - (N, 2)  : softmax classifier  → returned as-is
+        - (N, F)  : autoencoder (F == input features)
+                    → per-sample MSE reconstruction error is converted
+                      to P(anomaly) via sigmoid, P(normal) = 1 - P(anomaly)
         """
-        # Convert to tensor
         X_tensor = torch.tensor(X_numpy, dtype=torch.float32).to(self.device)
-        
+
         with torch.no_grad():
             outputs = self.model(X_tensor)
-            
-            # If model creates logits/probabilities
-            # Assuming binary classification where output is probability of class 1 (Fraud)
-            # or logits.
-            
-            # Check shape to determine if it's single output (sigmoid) or 2 outputs (softmax)
-            if outputs.shape[1] == 1:
-                # Single output (probability of class 1)
-                probs_1 = outputs.cpu().numpy().flatten()
-                probs_0 = 1.0 - probs_1
-                return np.column_stack([probs_0, probs_1])
-            else:
-                # Multiple outputs (softmax logic usually)
-                # If logits, apply softmax? The model in notebook ends with Sigmoid() and 1 output unit
-                # but let's be safe.
-                # Actually, mlp_build_model ends with Sigmoid() -> probabilities.
-                return outputs.cpu().numpy()
+            out_np = outputs.cpu().numpy()
+
+        n_out_cols = out_np.shape[1] if out_np.ndim > 1 else 1
+
+        if n_out_cols == 1:
+            # Sigmoid binary classifier: single probability of class 1
+            probs_1 = out_np.flatten()
+            return np.column_stack([1.0 - probs_1, probs_1])
+
+        if n_out_cols == 2:
+            # Softmax binary classifier: already [P(0), P(1)]
+            return out_np
+
+        # Autoencoder / reconstruction model:
+        # output shape matches input (n_out_cols == n_input_features).
+        # Convert reconstruction error → anomaly probability.
+        X_np = X_numpy  # original input to compare against
+        mse = np.mean((X_np - out_np) ** 2, axis=1)   # shape (N,)
+        # Sigmoid maps unbounded MSE → (0, 1); higher error → higher P(anomaly)
+        probs_anomaly = 1.0 / (1.0 + np.exp(-mse))
+        return np.column_stack([1.0 - probs_anomaly, probs_anomaly])
 
     def init_lime_explainer(self):
         # Create LIME Explainer
